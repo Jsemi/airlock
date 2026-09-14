@@ -8,7 +8,10 @@ directly via fork + chroot + exec:
 
 - **chroot** into the assembled overlayfs rootfs.
 - **uid/gid** switched to the container user (read from `start` RPC
-  params, derived host-side from the image's `/etc/passwd`).
+  params). The image's `USER` is resolved host-side the same way Docker
+  does it: names are looked up in the image's own `/etc/passwd` and
+  `/etc/group`, a bare user takes its primary group from `passwd`, and an
+  unknown name is an error rather than a fallback to root.
 - **PTY** allocated when stdin is a TTY; the host terminal size is
   sent as the initial PTY dimensions, and resize events (SIGWINCH) are
   forwarded.

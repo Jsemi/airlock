@@ -357,7 +357,10 @@ fn build_oci_image(
     }
 
     let cfg = image_config.config.as_ref();
-    let (uid, gid) = parse_user(cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0"));
+    let (uid, gid) = resolve_user(
+        &ordered_layers,
+        cfg.and_then(|c| c.user.as_deref()).unwrap_or(""),
+    )?;
     let container_home = lookup_home_dir(&ordered_layers, uid)?;
 
     // Resolve container command: entrypoint + cmd merged
@@ -452,12 +455,70 @@ pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
     }
 }
 
-/// Parse a `USER` string (`uid[:gid]`) into numeric uid/gid.
-fn parse_user(user: &str) -> (u32, u32) {
-    let parts: Vec<&str> = user.split(':').collect();
-    let uid = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let gid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (uid, gid)
+/// Resolve an image `USER` string into numeric uid/gid.
+///
+/// The OCI image spec allows `user`, `uid`, `user:group`, `uid:gid`,
+/// `uid:group` and `user:gid`. Names are looked up in the image's own
+/// `/etc/passwd` and `/etc/group` (via [`lookup_layer_record`]), matching
+/// what Docker does; a bare user with no group part takes that user's
+/// primary gid from `passwd`. An empty string means root, as it does for
+/// an image that never sets `USER`.
+///
+/// A name that no layer declares is an error rather than a fallback to
+/// root: silently promoting an image that asked for an unprivileged user
+/// is exactly the outcome the image author wrote `USER` to prevent.
+fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)> {
+    let (user_part, group_part) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+
+    // Each passwd record is `name:pw:uid:gid:gecos:home:shell`; a match
+    // yields `(uid, primary gid)`.
+    let passwd_record = |matches: &dyn Fn(&[&str]) -> bool| {
+        lookup_layer_record(layer_keys, "etc/passwd", |f| {
+            if f.len() >= 4 && matches(f) {
+                Some((f[2].parse::<u32>().ok()?, f[3].parse::<u32>().ok()?))
+            } else {
+                None
+            }
+        })
+    };
+
+    let (uid, primary_gid) = if user_part.is_empty() {
+        (0, None)
+    } else if let Ok(uid) = user_part.parse::<u32>() {
+        let record = passwd_record(&|f| f[2].parse::<u32>().ok() == Some(uid))?;
+        (uid, record.map(|(_, gid)| gid))
+    } else {
+        let (uid, gid) = passwd_record(&|f| f[0] == user_part)?
+            .ok_or_else(|| anyhow::anyhow!("no user {user_part} found in any layer /etc/passwd"))?;
+        (uid, Some(gid))
+    };
+
+    let gid = match group_part {
+        None | Some("") => primary_gid.unwrap_or(0),
+        Some(g) => resolve_group(layer_keys, g)?,
+    };
+
+    Ok((uid, gid))
+}
+
+/// Resolve the group half of a `USER` string: a numeric gid is used as-is,
+/// a name is looked up in the image's `/etc/group`.
+fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    // Each group record is `name:pw:gid:members`.
+    lookup_layer_record(layer_keys, "etc/group", |f| {
+        if f.len() >= 3 && f[0] == group {
+            f[2].parse::<u32>().ok()
+        } else {
+            None
+        }
+    })?
+    .ok_or_else(|| anyhow::anyhow!("no group {group} found in any layer /etc/group"))
 }
 
 enum ImageChangeAction {
@@ -905,30 +966,47 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
-/// Look up a user's home directory by walking `/etc/passwd` in the per-layer
-/// cache, topmost first. The first layer with a matching uid wins.
+/// Walk `rel_path` (e.g. `etc/passwd`) through the per-layer cache, topmost
+/// first, splitting each line on `:` and returning the first record for
+/// which `pick` yields a value.
 ///
 /// Reads from individual layer trees under `~/.cache/airlock/oci/layers/` —
 /// the host has no merged rootfs to consult for this lookup. Whiteouts
 /// manifest as empty files (which parse to zero matches and fall through
 /// to the next layer); this is coarser than real overlayfs semantics but
 /// is a safe superset for the common case of images that never delete
-/// `/etc/passwd` in an upper layer.
-fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
+/// `/etc/passwd` in an upper layer. The same coarseness means a record an
+/// upper layer *removed* from its copy of the file is still found in a
+/// lower layer's copy — the walk keeps going past a file that exists but
+/// has no match, where a merged rootfs would have stopped at it.
+fn lookup_layer_record<T>(
+    layer_keys: &[String],
+    rel_path: &str,
+    pick: impl Fn(&[&str]) -> Option<T>,
+) -> anyhow::Result<Option<T>> {
     for key in layer_keys {
-        let passwd_path = cache::layer_dir(key)?.join("etc/passwd");
-        let Ok(content) = std::fs::read_to_string(&passwd_path) else {
+        let path = cache::layer_dir(key)?.join(rel_path);
+        let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
         for line in content.lines() {
             let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
-                return Ok(fields[5].to_string());
+            if let Some(value) = pick(&fields) {
+                return Ok(Some(value));
             }
         }
     }
+    Ok(None)
+}
 
-    anyhow::bail!("no home directory found for uid {uid} in any layer /etc/passwd")
+/// Look up a user's home directory by uid in the image's `/etc/passwd`.
+fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
+    lookup_layer_record(layer_keys, "etc/passwd", |f| {
+        (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
+    })?
+    .ok_or_else(|| {
+        anyhow::anyhow!("no home directory found for uid {uid} in any layer /etc/passwd")
+    })
 }
 
 #[cfg(test)]
@@ -1017,5 +1095,107 @@ mod tests {
         write_cached_image(&path, &sample_image("sha256:empty", &[])).unwrap();
 
         assert!(read_ready_image(&path).is_none());
+    }
+
+    /// Write a layer whose `/etc/passwd` and `/etc/group` declare root and
+    /// one unprivileged user, the way every `node`, `python`, `debian`
+    /// derived image does.
+    fn make_layer_with_passwd(digest: &str) -> String {
+        let key = cache::layer_key(digest);
+        let dir = cache::layer_dir(&key).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::write(
+            dir.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nnode:x:1000:1000:Node:/home/node:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("etc/group"), "root:x:0:\nnode:x:1000:\n").unwrap();
+        key
+    }
+
+    fn config_with_user(user: &str) -> OciConfig {
+        OciConfig {
+            config: Some(oci_client::config::Config {
+                user: Some(user.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The OCI image spec allows `USER` to be `user`, `uid`, `user:group`,
+    /// `uid:gid`, `uid:group` or `user:gid`. Docker resolves names through the
+    /// image's `/etc/passwd`; the manual (technical/container-execution.md)
+    /// says airlock does the same. An image that says `USER node` must
+    /// therefore run as uid 1000, not as root.
+    #[test]
+    fn named_user_in_image_config_does_not_become_root() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let layer = make_layer_with_passwd("sha256:passwd-layer");
+
+        for user in [
+            "node",
+            "1000",
+            "node:node",
+            "1000:node",
+            "node:1000",
+            "1000:1000",
+        ] {
+            let image = build_oci_image(
+                "sha256:img".to_string(),
+                "node:22".to_string(),
+                vec![layer.clone()],
+                &config_with_user(user),
+            )
+            .unwrap();
+
+            assert_eq!(
+                (image.uid, image.gid),
+                (1000, 1000),
+                "USER {user:?} must resolve through /etc/passwd, not fall back to root"
+            );
+            assert_eq!(
+                image.container_home, "/home/node",
+                "USER {user:?} must get the named user's home"
+            );
+        }
+    }
+
+    /// A `USER` name the image never declares is the same mistake as a
+    /// typo in a Dockerfile, and Docker refuses to start such an image.
+    /// Falling back to root here would quietly hand out the privilege the
+    /// image author was trying to give up.
+    #[test]
+    fn unknown_user_or_group_name_is_an_error_not_root() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let layer = make_layer_with_passwd("sha256:passwd-layer-unknown");
+
+        for user in ["ghost", "ghost:node", "node:ghost", "1000:ghost"] {
+            let result = build_oci_image(
+                "sha256:img".to_string(),
+                "node:22".to_string(),
+                vec![layer.clone()],
+                &config_with_user(user),
+            );
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("USER {user:?} must be rejected, not resolved"));
+            assert!(
+                err.to_string().contains("ghost"),
+                "error for USER {user:?} should name the missing entry: {err}"
+            );
+        }
     }
 }
