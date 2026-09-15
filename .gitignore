@@ -7,3 +7,5 @@
 *.local.json
 *.local.toml
 /.tmp
+/.promptcellar
+/.prompts
