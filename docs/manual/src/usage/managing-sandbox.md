@@ -81,13 +81,3 @@ all runtime state:
 
 You should never need to touch these files directly. If something goes wrong,
 `airlock rm` and a fresh `airlock start` is the cleanest recovery path.
-
-One case asks for exactly that. Airlock versions before
-[#12](https://github.com/milankinen/airlock/pull/12) resolved a named
-`USER` (such as `USER node`) to root, so a sandbox created with one of
-them has been running as the wrong user and its disk holds files owned
-by that user. `airlock start` detects such a sandbox the first time it
-runs after the fix and refuses to start it, explaining why. Run
-`airlock rm` and start again; the image is re-prepared with the correct
-user. Sandboxes whose image runs as root, or as a numeric user, are
-verified silently and keep their data.
