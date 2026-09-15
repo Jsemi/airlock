@@ -79,7 +79,7 @@ use crate::assets::Assets;
 use crate::cli;
 use crate::cli::{CliArgs, LogLevel};
 use crate::oci::OciImage;
-use crate::project::Project;
+use crate::project::{Project, SandboxEnv};
 use crate::vm::config::VmShare;
 
 /// A running VM instance. Dropping this kills the VM and stops file sync.
@@ -97,7 +97,8 @@ pub struct VmInstance {
     pub container_home: String,
     /// Fully resolved command (args.args + login shell applied).
     pub cmd: Vec<String>,
-    /// Fully resolved environment (project.config.env overrides applied).
+    /// Fully resolved environment (guest-visible `[env]` values layered
+    /// over the image env; masked entries carry their surrogate).
     pub env: Vec<String>,
     pub cwd: String,
     pub uid: u32,
@@ -160,7 +161,7 @@ pub async fn start(
         &project.host_cwd,
     )?;
     let cmd = resolve_cmd(args, image);
-    let env = resolve_env(project, image)?;
+    let env = resolve_env(image, &project.env);
     let cwd = project.guest_cwd.to_string_lossy().into_owned();
 
     log_config(project, &shares);
@@ -353,18 +354,16 @@ fn resolve_cmd(args: &CliArgs, image: &OciImage) -> Vec<String> {
     }
 }
 
-/// Resolve the final container environment: image env with project overrides applied.
-fn resolve_env(project: &Project, image: &OciImage) -> anyhow::Result<Vec<String>> {
+/// Resolve the final container environment: image env with the guest-visible
+/// `[env]` values layered on top. Masked entries contribute their surrogate,
+/// never the real value.
+fn resolve_env(image: &OciImage, sandbox_env: &SandboxEnv) -> Vec<String> {
     let mut env = image.env.clone();
-    for (key, template) in &project.config.env {
-        let value = project
-            .vault
-            .subst(template)
-            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
+    for (key, value) in sandbox_env.guest_entries() {
         env.retain(|existing| !existing.starts_with(&format!("{key}=")));
         env.push(format!("{key}={value}"));
     }
-    Ok(env)
+    env
 }
 
 /// Build the kernel command line string.

@@ -7,6 +7,7 @@
 
 pub mod body;
 mod executor;
+pub mod inject;
 pub mod middleware;
 mod senders;
 
@@ -127,24 +128,37 @@ pub async fn relay(
     };
 
     let middleware = target.middleware;
+    let secrets = target.secrets;
     let target_host = target.host.clone();
     let target_port = target.port;
     let allowed = target.allowed;
-    let service = service_fn(move |req: Request<Incoming>| {
+    let service = service_fn(move |mut req: Request<Incoming>| {
         let sender = sender.clone();
         let middleware = middleware.clone();
+        let secrets = secrets.clone();
         let events = events.clone();
         let target_host = target_host.clone();
         let deny_reporter = deny_reporter.clone();
         async move {
+            // The monitor sees the request as the guest sent it (surrogates
+            // intact): the event is emitted before any secret is unmasked.
             let id = emit_request_event(&events, &req, &target_host, target_port, allowed);
             let connect_host: std::rc::Rc<str> = std::rc::Rc::from(target_host.as_str());
-            let result =
-                middleware::run(req, &middleware, deny_reporter, connect_host, move |req| {
-                    let sender = sender.clone();
-                    async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
-                })
-                .await;
+            let send = move |req| {
+                let sender = sender.clone();
+                async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
+            };
+            // Unmask before middleware so scripts observe the real request;
+            // re-mask after middleware so nothing a script adds can carry the
+            // real value back into the guest.
+            let result = match inject::unmask_request(req.headers_mut(), &secrets) {
+                Err(e) => Err(e),
+                Ok(()) => middleware::run(req, &middleware, deny_reporter, connect_host, send)
+                    .await
+                    .and_then(|mut resp| {
+                        inject::mask_response(resp.headers_mut(), &secrets).map(|()| resp)
+                    }),
+            };
 
             match result {
                 Ok(resp) => {
@@ -152,10 +166,14 @@ pub async fn relay(
                     Ok::<_, hyper::Error>(resp)
                 }
                 Err(e) => {
-                    debug!("middleware error: {e}");
+                    // The request was unmasked before middleware ran, so a
+                    // script error that quotes a header may carry the real
+                    // secret. Mask the text before it is logged or sent.
+                    let msg = inject::mask_text(&e.to_string(), &secrets);
+                    debug!("middleware error: {msg}");
                     let resp = Response::builder()
                         .status(502)
-                        .body(Either::Right(Full::new(Bytes::from(format!("{e}\n")))))
+                        .body(Either::Right(Full::new(Bytes::from(format!("{msg}\n")))))
                         .unwrap();
                     emit_response_event(&events, id, &resp);
                     Ok(resp)

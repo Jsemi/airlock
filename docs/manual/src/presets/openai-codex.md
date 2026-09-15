@@ -3,19 +3,19 @@
 The `openai-codex` preset bundles the sandbox setup for the
 [OpenAI Codex CLI](https://github.com/openai/codex). It keeps your
 OpenAI API key on the host and lets the sandbox run against a
-placeholder value — Codex talks to OpenAI normally, but it never
-sees the real credential.
+same-length random surrogate — Codex talks to OpenAI normally, but
+it never sees the real credential.
 
 ## What the preset does
 
-Codex reads its API key from `OPENAI_API_KEY` at startup and sends
-it as a bearer token on every request. The preset sets the VM's env
-var to a placeholder, and airlock substitutes the real key at the
-host boundary on the way out to OpenAI.
+Codex reads its API key from `OPENAI_API_KEY` and sends it as a
+bearer token on every request. The preset
+[masks](../configuration/env.md#masking) that variable and the
+`codex` rule [injects](../configuration/network.md#injecting-masked-secrets)
+the real key into request headers to the OpenAI hosts.
 
-- **Your API key stays on the host.** Requests to `api.openai.com`
-  are intercepted on the host and the real `Authorization` header is
-  injected there; inside the VM, `OPENAI_API_KEY` is just a placeholder.
+- **Your API key stays on the host.** Inside the VM,
+  `OPENAI_API_KEY` is a random string of the same length.
 - **Only OpenAI endpoints are reachable** (`api.openai.com` and
   `auth.openai.com`). Everything else stays blocked by your
   deny-by-default policy.
@@ -48,10 +48,9 @@ Store your OpenAI API key in the airlock
 airlock secrets add OPENAI_API_KEY
 ```
 
-The middleware resolves `${OPENAI_API_KEY}` from the host env first
-and the vault as a fallback. A missing value aborts `airlock start`
-with a clear error rather than silently shipping requests without
-auth.
+The preset resolves `${OPENAI_API_KEY}` from the host env first and
+the vault as a fallback. A missing value aborts `airlock start` with
+a clear error rather than silently shipping requests without auth.
 
 ## Running it
 

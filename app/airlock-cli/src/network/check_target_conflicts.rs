@@ -81,7 +81,7 @@ pub fn check_passthrough_conflicts(
         Ok(())
     } else {
         anyhow::bail!(
-            "network config: passthrough target(s) overlap middleware target(s):\n  {}",
+            "network config: passthrough target(s) overlap intercepting (middleware/inject) target(s):\n  {}",
             conflicts.join("\n  ")
         );
     }

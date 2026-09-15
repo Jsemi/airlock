@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+pub(crate) mod sandbox_env;
+
+pub use self::sandbox_env::{EnvError, MaskedSecret, SandboxEnv};
 use crate::config::Config;
 use crate::vault::Vault;
 
@@ -23,6 +26,10 @@ pub struct Project {
     /// Working directory inside the container (defaults to `host_cwd`).
     pub guest_cwd: PathBuf,
     pub config: Config,
+    /// The resolved `[env]` section: host-substituted values plus surrogates
+    /// for masked entries. Populated by [`lock`] only — the read-only
+    /// [`load`] path never substitutes secrets, so there it is empty.
+    pub env: SandboxEnv,
     /// CA certificate PEM (read from `ca.json` at load time).
     pub ca_cert: String,
     /// CA private key PEM (read from `ca.json` at load time).
@@ -122,6 +129,7 @@ pub fn load(vault: Vault) -> anyhow::Result<Project> {
         host_cwd,
         guest_cwd,
         config,
+        env: SandboxEnv::empty(),
         ca_cert,
         ca_key,
         ca_newly_generated: false,
@@ -170,6 +178,17 @@ pub fn lock(
     }
     let (ca_cert, ca_key) = read_ca(&sandbox_dir)?;
 
+    // Resolve `[env]` now, while we hold the lock but before anything slow:
+    // a missing host variable or vault secret fails here rather than after
+    // an image pull, and the network layer needs the masked secrets. Check
+    // the injected ones here too, for the same reason.
+    let env = SandboxEnv::resolve(&config.env, &vault)?;
+    for rule in config.network.rules.values().filter(|r| r.enabled) {
+        for name in &rule.inject {
+            env.check_injectable(name)?;
+        }
+    }
+
     Ok(Project {
         cache_dir,
         sandbox_dir,
@@ -177,6 +196,7 @@ pub fn lock(
         host_cwd,
         guest_cwd,
         config,
+        env,
         ca_cert,
         ca_key,
         ca_newly_generated,

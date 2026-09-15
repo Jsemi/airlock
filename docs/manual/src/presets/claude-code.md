@@ -8,15 +8,14 @@ ships the `claude` CLI and drop the preset into your config.
 
 ## What the preset does
 
-The real OAuth token stays on the host; the VM only sees a
-placeholder. The token is injected into Anthropic API requests at
-the host boundary, so it is never exposed to processes running
-inside the sandbox.
+The real OAuth token stays on the host. The VM sees a same-length
+random surrogate, and the real token is swapped in at the host
+boundary.
 
-- **Your token stays on the host.** Requests to `api.anthropic.com`
-  are intercepted by airlock on the host and the real
-  `Authorization` header is injected there. Inside the VM,
-  `CLAUDE_CODE_OAUTH_TOKEN` is a placeholder value.
+- **Your token stays on the host.** `CLAUDE_CODE_OAUTH_TOKEN` is
+  [masked](../configuration/env.md#masking) and the `claude-code`
+  rule [injects](../configuration/network.md#injecting-masked-secrets)
+  the real value into request headers to the Anthropic hosts.
 - **Only Anthropic endpoints are reachable** (`api.anthropic.com`,
   `claude.ai`, `downloads.claude.ai`, `platform.claude.com`).
   Everything else stays blocked by your deny-by-default policy.
@@ -48,7 +47,7 @@ already installed. For a real project, you might prefer your own
 
 ## Providing the OAuth token
 
-The middleware expects `CLAUDE_CODE_OAUTH_TOKEN` on the **host**.
+The preset expects `CLAUDE_CODE_OAUTH_TOKEN` on the **host**.
 Get one by running `claude setup-token` outside the sandbox.
 
 Store the token in the airlock

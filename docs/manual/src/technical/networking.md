@@ -129,6 +129,18 @@ compilation overhead) and run per HTTP request/response. See
 [Network scripting](../advanced/network-scripting.md) for the
 scripting API.
 
+## Secret injection
+
+At startup the CLI resolves `[env]` once and generates a same-length
+random surrogate for each masked entry; the guest gets the surrogate,
+the host keeps the real value. Each injecting rule's allow patterns
+carry its secrets, resolved per connection like middleware.
+
+Per HTTP request the proxy does a byte-level search/replace on header
+values: surrogate → real before the Lua chain, real → surrogate after
+it. Longer values are replaced first so nested secrets cannot leak.
+Header names, URI and bodies are untouched.
+
 ## Localhost port forwarding
 
 Ports declared as "host ports" in the config get a dedicated

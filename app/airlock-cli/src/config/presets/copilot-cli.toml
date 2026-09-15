@@ -4,33 +4,21 @@
 # https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-environment
 
 [env]
-COPILOT_GITHUB_TOKEN = "github_pat_NOTReal"
+# The real token stays on the host: the sandbox sees a same-length random
+# surrogate, and the `inject` rule below swaps the real value into request
+# headers at the host boundary.
+COPILOT_GITHUB_TOKEN = { value = "${COPILOT_GITHUB_TOKEN}", mask = true }
 
+# Injection covers every host this rule allows (including the telemetry
+# hosts under *.githubcopilot.com) — the token only ever leaves the host in
+# requests where Copilot itself put the surrogate.
 [network.rules.copilot-cli]
+inject = ["COPILOT_GITHUB_TOKEN"]
 allow = [
     "github.com:443",
     "api.github.com:443",
     "*.githubcopilot.com:443",
 ]
-
-# Middleware targets only the API hosts — not telemetry.*.githubcopilot.com —
-# so the token is not sent to telemetry endpoints.
-[network.middleware.copilot-cli-api-token]
-target = [
-    "api.individual.githubcopilot.com:443",
-    "api.business.githubcopilot.com:443",
-    "api.enterprise.githubcopilot.com:443",
-    "api.github.com:443",
-]
-env.TOKEN = "${COPILOT_GITHUB_TOKEN}"
-script = """
-local copilot = req:hostMatches("*.githubcopilot.com")
-local github = req:hostMatches("api.github.com")
-  and (req.path:sub(1, 9) == "/copilot/" or req.path:sub(1, 18) == "/copilot_internal/")
-if env.TOKEN and (copilot or github) then
-  req:setHeader("Authorization", "Bearer " .. env.TOKEN)
-end
-"""
 
 [mounts.copilot-session]
 source = "~/.airlock/copilot-cli"

@@ -19,6 +19,7 @@ use crate::config::config::{self, MiddlewareRule, NetworkRule, Policy};
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
 use crate::network::{Network, NetworkState, rules};
+use crate::project::{MaskedSecret, SandboxEnv};
 
 /// Collects log messages from Lua `log()` calls for test assertions.
 #[derive(Clone)]
@@ -73,6 +74,10 @@ pub struct TestNetworkConfig {
     pub middleware_scripts: Vec<(&'static str, &'static str)>,
     /// Extra CA PEMs to trust (e.g. test server CAs)
     pub trust_cas: Vec<String>,
+    /// Masked secrets injected by the `test-allow` rule (all allowed hosts).
+    pub inject: Vec<MaskedSecret>,
+    /// Hosts allowed by a second rule that never injects anything.
+    pub plain_allowed_hosts: Vec<String>,
 }
 
 impl Default for TestNetworkConfig {
@@ -81,6 +86,8 @@ impl Default for TestNetworkConfig {
             allowed_hosts: vec!["*".into()],
             middleware_scripts: vec![],
             trust_cas: vec![],
+            inject: vec![],
+            plain_allowed_hosts: vec![],
         }
     }
 }
@@ -142,7 +149,7 @@ where
     }));
 }
 
-fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
+pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     // Build rules from test config (no middleware — rules are pure allow/deny).
     let mut rules = BTreeMap::new();
     let middleware_targets = cfg.allowed_hosts.clone();
@@ -156,6 +163,22 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
                 allow: cfg.allowed_hosts,
                 deny: vec![],
                 passthrough: false,
+                inject: cfg.inject.iter().map(|s| s.name.clone()).collect(),
+            },
+        );
+    }
+
+    // Secondary allow rule that never injects — for asserting that the
+    // surrogate passes through untouched on hosts the inject rule misses.
+    if !cfg.plain_allowed_hosts.is_empty() {
+        rules.insert(
+            "test-allow-plain".to_string(),
+            NetworkRule {
+                enabled: true,
+                allow: cfg.plain_allowed_hosts,
+                deny: vec![],
+                passthrough: false,
+                inject: vec![],
             },
         );
     }
@@ -191,6 +214,8 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     // the substitution machinery a no-op backend and never prompts.
     let vault = crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled);
     let middleware_targets = rules::resolve_middleware(&config, &vault, &log_fn).unwrap();
+    let sandbox_env = SandboxEnv::from_secrets(cfg.inject);
+    let inject_targets = rules::resolve_inject(&config, &sandbox_env).unwrap();
 
     // MITM CA
     let mitm_ca_key = rcgen::KeyPair::generate().unwrap();
@@ -226,6 +251,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             deny_targets: rule_targets.deny,
             passthrough_targets: rule_targets.passthrough,
             middleware_targets,
+            inject_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),
             events: tokio::sync::broadcast::channel(1).0,

@@ -45,3 +45,24 @@ Values you don't want to keep in your shell environment can be saved in
 the airlock secret vault and referenced by the same `${VAR}` syntax.
 See the [Secrets management](../secrets.md) chapter for the full
 reference — storage backends, trade-offs, and recommendations.
+
+## Masking
+
+Set `mask = true` to keep a secret out of the sandbox:
+
+```toml
+[env]
+API_TOKEN = { value = "${MY_API_TOKEN}", mask = true }
+```
+
+Inside the sandbox the variable holds a **surrogate**: a random
+alphanumeric string with the same number of characters, regenerated on
+every start. The real value stays on the host. To use the secret, list it
+in a network rule's [`inject`](network.md#injecting-masked-secrets), which
+swaps the surrogate for the real value in HTTP request headers.
+
+- The table form accepts only `value` and `mask`; any other key is an error.
+- `value` is substituted first (`${VAR}` works as usual), then masked.
+- A later config layer that writes the plain string form only replaces the
+  value; the entry stays masked. Set `mask = false` to unmask.
+- Daemons and `airlock exec` see the surrogate too.

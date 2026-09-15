@@ -196,6 +196,60 @@ fn tls_mitm_with_middleware() {
     );
 }
 
+#[test]
+fn tls_mitm_with_inject_masks_response_header() {
+    let (server_tls, server_ca_pem) = make_server_tls();
+    let secret = crate::project::MaskedSecret {
+        name: "TOKEN".into(),
+        real: "sk-real-token-0123456789".into(),
+        surrogate: "SURROGATEabcdef0123456789".into(),
+    };
+    let real = secret.real.clone();
+    let surrogate = secret.surrogate.clone();
+
+    run_with_config(
+        TestNetworkConfig {
+            trust_cas: vec![server_ca_pem],
+            inject: vec![secret],
+            ..Default::default()
+        },
+        |proxy, _log, mitm_ca_pem| async move {
+            // Upstream leaks the real value in a response header; the guest
+            // must only ever see the surrogate, even through MITM TLS.
+            let leaked = real.clone();
+            let addr = serve_https(
+                Router::new().route(
+                    "/",
+                    get(move || {
+                        let leaked = leaked.clone();
+                        async move { ([("x-secret", leaked)], "ok") }
+                    }),
+                ),
+                server_tls,
+            )
+            .await;
+
+            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .unwrap();
+            let resp = tls_roundtrip(
+                conn.into_stream(),
+                &mitm_ca_pem,
+                "127.0.0.1",
+                addr.port(),
+                "/",
+            )
+            .await;
+            assert!(resp.contains("200"), "expected 200: {resp}");
+            assert!(
+                resp.contains(&format!("x-secret: {surrogate}")),
+                "expected masked header: {resp}"
+            );
+            assert!(!resp.contains(&real), "real value leaked: {resp}");
+        },
+    );
+}
+
 // ── ALPN tests ──────────────────────────────────────────
 
 #[test]

@@ -89,14 +89,41 @@ allow = ["db.example.com:5432"]
 passthrough = true
 ```
 
-A passthrough target cannot also be covered by middleware — the two are
-incompatible, and airlock refuses to start if it finds a rule target that
-also appears in any middleware `target` list, naming the offending rule
-and middleware.
+A passthrough target cannot also be covered by middleware or by an
+injecting rule — both need interception. Airlock refuses to start and
+names the conflict.
 
 Port and unix socket forwards are always passthrough: the guest-side
 `localhost:<port>` may carry arbitrary traffic to whatever service runs
 on the host port, so interception is suppressed automatically.
+
+### Injecting masked secrets
+
+`inject` lists [masked](env.md#masking) variables. For HTTP traffic to the
+rule's `allow` targets, airlock replaces the surrogate with the real value
+in request headers, and the real value with the surrogate in response
+headers.
+
+```toml
+[env]
+CLAUDE_CODE_OAUTH_TOKEN = { value = "${CLAUDE_CODE_OAUTH_TOKEN}", mask = true }
+
+[network.rules.claude-code]
+inject = ["CLAUDE_CODE_OAUTH_TOKEN"]
+allow = ["api.anthropic.com:443", "claude.ai:443"]
+```
+
+The sandboxed program sends `Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN`
+as it would on the host; the real token is filled in at the host boundary.
+
+- Names must be `[env]` entries with `mask = true`.
+- Values must be at least 8 characters and valid in an HTTP header.
+- Injecting rules cannot be `passthrough`.
+- Only header values are rewritten — every header, every occurrence.
+  Header names, paths and bodies are not.
+- Request headers are unmasked before [middleware](#middleware) runs and
+  response headers are masked after it, so scripts see real values. The
+  monitor shows surrogates.
 
 ## Middleware
 

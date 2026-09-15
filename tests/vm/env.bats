@@ -23,6 +23,7 @@ setup_file() {
 BASE_VAR = "from-base-config"
 OVERRIDE_VAR = "from-base"
 SUBST_VAR = "${HOST_TEST_VALUE}"
+MASKED_VAR = { value = "${HOST_TEST_VALUE}", mask = true }
 EOF
 
     cat > airlock.local.toml <<'EOF'
@@ -63,4 +64,12 @@ setup() {
     run_vm sh -c 'echo $SUBST_VAR'
     assert_success
     assert_output_contains "substituted-from-host"
+}
+
+@test "masked env var has the real value's length but not its content" {
+    run_vm sh -c 'printf "len=%s value=%s\n" "${#MASKED_VAR}" "$MASKED_VAR"'
+    assert_success
+    # "substituted-from-host" is 21 characters.
+    assert_output_contains "len=21"
+    assert_output_not_contains "substituted-from-host"
 }

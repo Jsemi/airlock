@@ -34,8 +34,11 @@ pub struct Config {
     pub disk: Disk,
     /// Environment variables injected into the container.
     /// Values support `${VAR}` substitution from the host environment.
+    /// An entry may be a plain string or `{ value = "...", mask = true }`;
+    /// masked entries reach the guest as a random surrogate of the same
+    /// length (see [`config::EnvVar`]).
     #[config(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, config::EnvVar>,
     /// Sidecar processes started in parallel with the main shell.
     #[config(default)]
     pub daemons: BTreeMap<String, Daemon>,
@@ -224,6 +227,75 @@ pub mod config {
     }
 
     impl WellKnown for ImageRef {
+        type Deserializer = smart_config::de::Serde<
+            {
+                smart_config::metadata::BasicTypes::STRING
+                    .or(smart_config::metadata::BasicTypes::OBJECT)
+                    .raw()
+            },
+        >;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
+    /// One `[env]` entry — either a plain string or a full config object.
+    ///
+    /// String form:  `TOKEN = "${TOKEN}"`
+    /// Object form:  `TOKEN = { value = "${TOKEN}", mask = true }`
+    ///
+    /// With `mask = true` the guest sees a random alphanumeric surrogate of
+    /// the same length instead of the real value. The real value can still
+    /// be substituted into outbound HTTP headers on the host through a
+    /// network rule's `inject` list.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct EnvVar {
+        /// Value template; supports `${VAR}` substitution from the host.
+        pub value: String,
+        /// Replace the value with a same-length surrogate inside the guest.
+        pub mask: bool,
+    }
+
+    impl EnvVar {
+        /// A plain, unmasked entry.
+        pub fn plain(value: impl Into<String>) -> Self {
+            Self {
+                value: value.into(),
+                mask: false,
+            }
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for EnvVar {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            use serde::de::Error as _;
+
+            // `deny_unknown_fields` so `{ value = "…", masked = true }` is
+            // an error, not a silent `mask = false` that leaks the real
+            // value into the guest. Dispatching on the raw value (instead of
+            // an untagged enum) keeps that error's own message — which
+            // names the unknown key — instead of serde's generic "did not
+            // match any variant".
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Full {
+                value: String,
+                #[serde(default)]
+                mask: bool,
+            }
+            match serde_json::Value::deserialize(d)? {
+                serde_json::Value::String(value) => Ok(EnvVar::plain(value)),
+                table @ serde_json::Value::Object(_) => {
+                    let Full { value, mask } =
+                        serde_json::from_value(table).map_err(D::Error::custom)?;
+                    Ok(EnvVar { value, mask })
+                }
+                _ => Err(D::Error::custom(
+                    "expected a string or a table `{ value = \"...\", mask = true }`",
+                )),
+            }
+        }
+    }
+
+    impl WellKnown for EnvVar {
         type Deserializer = smart_config::de::Serde<
             {
                 smart_config::metadata::BasicTypes::STRING
@@ -543,6 +615,12 @@ pub mod config {
         /// error.
         #[config(default)]
         pub passthrough: bool,
+        /// Names of masked `[env]` variables whose real value is substituted
+        /// into HTTP request headers (and masked back in response headers)
+        /// for this rule's allow targets. Each name must be defined in
+        /// `[env]` with `mask = true`. Incompatible with `passthrough`.
+        #[config(default)]
+        pub inject: Vec<String>,
     }
 
     impl WellKnown for NetworkRule {

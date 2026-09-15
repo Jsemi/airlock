@@ -69,7 +69,7 @@ use std::time::SystemTime;
 use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use disabled::DisabledStorage;
+pub(crate) use disabled::DisabledStorage;
 use encrypted::EncryptedFileStorage;
 #[cfg(test)]
 use encrypted::PassphraseSource;

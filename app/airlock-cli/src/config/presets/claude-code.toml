@@ -1,14 +1,17 @@
 # Claude code development preset
 
 [env]
-# Claude needs a placeholder token to work
-CLAUDE_CODE_OAUTH_TOKEN = "real-token-will-be-injected"
+# The real token stays on the host: the sandbox sees a same-length random
+# surrogate, and the `inject` rule below swaps the real value into request
+# headers to the Anthropic API at the host boundary.
+CLAUDE_CODE_OAUTH_TOKEN = { value = "${CLAUDE_CODE_OAUTH_TOKEN}", mask = true }
 # Tell that we're inside sandbox
 IS_SANDBOX = "1"
 # Claude uses Node certs - must add airlock CA to the trusted certs
 NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt"
 
 [network.rules.claude-code]
+inject = ["CLAUDE_CODE_OAUTH_TOKEN"]
 allow = [
     "claude.ai:443",
     "downloads.claude.ai:443",
@@ -26,13 +29,3 @@ missing = "create-file"
 file_content = "{\"hasCompletedOnboarding\":true}"
 source = "~/.airlock/claude/claude.json"
 target = "~/.claude.json"
-
-# Inject real token at host middleware
-[network.middleware.claude-auth-token]
-target = ["api.anthropic.com:443"]
-env.TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}"
-script = """
-if env.TOKEN then
-  req:setHeader("Authorization", "Bearer " .. env.TOKEN)
-end
-"""

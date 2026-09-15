@@ -85,3 +85,55 @@ TEST_LOCAL_VAR = "loaded"'
     assert_failure
     assert_output_not_contains "Config error"
 }
+
+@test "masked env table form loads without config error" {
+    write_config '[env]
+TOKEN = { value = "static-token-value", mask = true }'
+    run_airlock show
+    assert_failure
+    assert_output_not_contains "invalid configuration"
+}
+
+@test "inject of masked env var loads without config error" {
+    write_config '[env]
+TOKEN = { value = "static-token-value", mask = true }
+
+[network.rules.api]
+allow = ["api.example.com:443"]
+inject = ["TOKEN"]'
+    run_airlock show
+    assert_failure
+    assert_output_not_contains "must be defined in [env] with mask = true"
+}
+
+@test "inject of unmasked env var reports config error" {
+    write_config '[env]
+TOKEN = "plain"
+
+[network.rules.api]
+allow = ["api.example.com:443"]
+inject = ["TOKEN"]'
+    run_airlock show
+    assert_failure
+    assert_output_contains "network.rules.api.inject"
+    assert_output_contains "TOKEN"
+    assert_output_contains "must be defined in [env] with mask = true"
+}
+
+@test "inject of undefined env var reports config error" {
+    write_config '[network.rules.api]
+allow = ["api.example.com:443"]
+inject = ["NOPE"]'
+    run_airlock show
+    assert_failure
+    assert_output_contains "NOPE"
+    assert_output_contains "must be defined in [env] with mask = true"
+}
+
+@test "masked env entry with unknown key reports config error" {
+    write_config '[env]
+TOKEN = { value = "x", masked = true }'
+    run_airlock show
+    assert_failure
+    assert_output_contains "invalid configuration"
+}

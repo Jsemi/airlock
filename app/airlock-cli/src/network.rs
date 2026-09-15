@@ -36,14 +36,16 @@ pub use self::control::NetworkControl;
 pub use self::deny_reporter::DenyReporter;
 use crate::config::config::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
-use crate::network::target::{MiddlewareTarget, NetworkTarget, ResolvedTarget};
+use crate::network::target::{
+    InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget, ResolvedTarget,
+};
 use crate::project::Project;
 
 const NETWORK_EVENTS_BUFFER: usize = 10;
 
 /// Build the [`Network`] from the sandbox config: load native CA roots,
-/// compile middleware scripts, resolve network targets, and prepare the
-/// TLS interceptor with the sandbox's CA.
+/// compile middleware scripts, resolve network and inject targets, and
+/// prepare the TLS interceptor with the sandbox's CA.
 pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
@@ -58,11 +60,13 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
     let log = middleware::tracing_log();
     let rule_targets = rules::resolve(net);
     let middleware_targets = rules::resolve_middleware(net, &project.vault, &log)?;
+    let inject_targets = rules::resolve_inject(net, &project.env)?;
 
-    check_target_conflicts::check_passthrough_conflicts(
-        &labeled_passthrough(net),
-        &labeled_middleware(net),
-    )?;
+    // Inject needs interception just like middleware, so it conflicts with
+    // passthrough the same way.
+    let mut intercepting = labeled_middleware(net);
+    intercepting.extend(labeled_inject(net));
+    check_target_conflicts::check_passthrough_conflicts(&labeled_passthrough(net), &intercepting)?;
     check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
@@ -87,11 +91,12 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         .collect();
 
     tracing::debug!(
-        "network: {} allow, {} deny, {} passthrough, {} middleware targets",
+        "network: {} allow, {} deny, {} passthrough, {} middleware, {} inject targets",
         rule_targets.allow.len(),
         rule_targets.deny.len(),
         rule_targets.passthrough.len(),
-        middleware_targets.len()
+        middleware_targets.len(),
+        inject_targets.len()
     );
 
     Ok(Network {
@@ -102,6 +107,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         deny_targets: rule_targets.deny,
         passthrough_targets: rule_targets.passthrough,
         middleware_targets,
+        inject_targets,
         port_forwards,
         socket_map,
         events,
@@ -150,6 +156,31 @@ fn labeled_middleware(
             let (host, port) = rules::parse_target(target_str);
             out.push(check_target_conflicts::LabeledTarget {
                 label: format!("middleware `{mw_name}` target=`{target_str}`"),
+                target: NetworkTarget {
+                    host: host.to_string(),
+                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                },
+            });
+        }
+    }
+    out
+}
+
+/// Extract labeled inject targets (allow patterns of rules with a non-empty
+/// `inject` list) for passthrough conflict checking. Paired with
+/// [`labeled_passthrough`], like [`labeled_middleware`].
+fn labeled_inject(
+    net: &crate::config::config::Network,
+) -> Vec<check_target_conflicts::LabeledTarget> {
+    let mut out = Vec::new();
+    for (rule_name, rule) in &net.rules {
+        if !rule.enabled || rule.inject.is_empty() {
+            continue;
+        }
+        for allow in &rule.allow {
+            let (host, port) = rules::parse_target(allow);
+            out.push(check_target_conflicts::LabeledTarget {
+                label: format!("rule `{rule_name}` inject target=`{allow}`"),
                 target: NetworkTarget {
                     host: host.to_string(),
                     port: port.and_then(|p| p.parse::<u16>().ok()),
@@ -209,6 +240,8 @@ pub struct Network {
     passthrough_targets: Vec<NetworkTarget>,
     /// Compiled middleware with target patterns.
     middleware_targets: Vec<MiddlewareTarget>,
+    /// Masked secrets to inject into HTTP headers, with target patterns.
+    inject_targets: Vec<InjectTarget>,
     /// Port forward mappings: guest_port → host_port.
     port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
@@ -288,13 +321,36 @@ impl Network {
         // HTTP; intercepting would break non-HTTP forwards (e.g. Postgres).
         let passthrough = allowed && (port_forwarded || self.is_passthrough_target(host, port));
 
+        // Secrets only matter where headers are actually rewritten.
+        let secrets = if allowed && !passthrough {
+            self.collect_secrets(host, port)
+        } else {
+            vec![]
+        };
+
         ResolvedTarget {
             host: host.to_string(),
             port,
             middleware,
+            secrets,
             allowed,
             passthrough,
         }
+    }
+
+    /// Collect the masked secrets of every inject target matching
+    /// `host:port`, deduplicated by variable name. Each entry is a shared
+    /// handle, so this only clones pointers.
+    fn collect_secrets(&self, host: &str, port: u16) -> Vec<InjectedSecret> {
+        let mut out: Vec<InjectedSecret> = Vec::new();
+        for target in self.inject_targets.iter().filter(|t| t.matches(host, port)) {
+            for s in &target.secrets {
+                if !out.iter().any(|o| o.name == s.name) {
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
     }
 
     fn is_passthrough_target(&self, host: &str, port: u16) -> bool {
@@ -376,6 +432,7 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         host: host.to_string(),
         port,
         middleware: vec![],
+        secrets: vec![],
         allowed: false,
         passthrough: false,
     }
@@ -398,6 +455,7 @@ mod labeled_target_tests {
             allow: allow.iter().map(|s| (*s).to_string()).collect(),
             deny: vec![],
             passthrough,
+            inject: vec![],
         }
     }
 
@@ -442,6 +500,32 @@ mod labeled_target_tests {
             .collect();
         assert_eq!(got.len(), 1);
         assert!(got[0].contains("pt-on"), "got: {got:?}");
+    }
+
+    #[test]
+    fn labeled_inject_lists_allow_patterns_of_injecting_rules() {
+        let mut injecting = rule(&["a:1", "b:2"], false, true);
+        injecting.inject = vec!["TOKEN".to_string()];
+        let mut disabled = rule(&["c:3"], false, false);
+        disabled.inject = vec!["TOKEN".to_string()];
+        let n = net(
+            vec![
+                ("inj", injecting),
+                ("inj-off", disabled),
+                ("plain", rule(&["d:4"], false, true)),
+            ],
+            vec![],
+        );
+        let got: Vec<String> = labeled_inject(&n).into_iter().map(|lt| lt.label).collect();
+        assert_eq!(got.len(), 2, "got: {got:?}");
+        assert!(
+            got.iter()
+                .all(|l| l.contains("inj") && l.contains("inject"))
+        );
+        assert!(
+            got[0].contains("a:1") && got[1].contains("b:2"),
+            "got: {got:?}"
+        );
     }
 
     #[test]

@@ -26,8 +26,9 @@ impl Drop for SockGuard {
 
 /// Accept `airlock exec` connections on a Unix socket and bridge each into the
 /// running VM supervisor via Cap'n Proto RPC. `base_env` is the sandbox's
-/// resolved environment (image env + config env) — `exec` clients send
-/// overrides which are merged onto this before each child is spawned.
+/// resolved environment (image env + config env, with surrogates for masked
+/// entries) — `exec` clients send overrides which are merged onto this
+/// before each child is spawned.
 pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<String>) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {

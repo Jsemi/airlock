@@ -36,9 +36,10 @@ pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     // 2. Load user config — for each slot, use the first extension found
     let mut user_config = serde_json::Value::Object(serde_json::Map::new());
     for base_path in &bases {
-        if let Some((path, value)) = load_first(base_path)? {
+        if let Some((path, mut value)) = load_first(base_path)? {
             tracing::debug!("config: loaded {}", path.display());
             tracing::trace!("config: {}: {value}", path.display());
+            normalize_env(&mut value);
             user_config = merge_json(user_config, value);
         }
     }
@@ -106,6 +107,7 @@ pub(super) fn apply_with_presets(
     applied: &mut HashSet<String>,
 ) -> anyhow::Result<serde_json::Value> {
     let preset_names = extract_presets(&mut config);
+    normalize_env(&mut config);
 
     for name in preset_names {
         if applied.contains(&name) {
@@ -119,8 +121,9 @@ pub(super) fn apply_with_presets(
             );
         }
 
-        let preset_config =
+        let mut preset_config =
             resolve(&name).ok_or_else(|| anyhow::anyhow!("unknown preset: `{name}`"))?;
+        normalize_env(&mut preset_config);
 
         tracing::debug!("config: applying preset `{name}`");
         chain.push(name.clone());
@@ -130,6 +133,29 @@ pub(super) fn apply_with_presets(
     }
 
     Ok(merge_json(base, config))
+}
+
+/// Rewrite every plain-string `[env]` entry of one config layer into its
+/// object form `{ "value": "..." }` before layers are merged.
+///
+/// `merge_json` lets a primitive overlay replace an object wholesale, so
+/// without this a `TOKEN = "${TOKEN}"` in `airlock.local.toml` would erase a
+/// base layer's `{ value = "${TOKEN}", mask = true }` — silently un-masking
+/// the secret. With both sides in object form the merge is field-wise: an
+/// overlay string only replaces `value` and inherits the base's `mask`.
+pub(super) fn normalize_env(layer: &mut serde_json::Value) {
+    let Some(env) = layer
+        .get_mut("env")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for entry in env.values_mut() {
+        if entry.is_string() {
+            let value = std::mem::take(entry);
+            *entry = serde_json::json!({ "value": value });
+        }
+    }
 }
 
 /// Extract and remove the `presets` array from a JSON value.
@@ -169,7 +195,42 @@ pub(super) fn parse_config(merged: serde_json::Value) -> anyhow::Result<Config> 
         anyhow::bail!("kvm is only supported on Linux");
     }
 
+    validate_inject(&config)?;
+
     Ok(config)
+}
+
+/// Every name in an enabled rule's `inject` list must be an `[env]` entry
+/// with `mask = true` — injecting an unmasked value would mean the guest
+/// already holds the real secret, and injecting an undefined one is a typo.
+/// An injecting rule also cannot be `passthrough` (injection needs
+/// interception). Reported in the same shape as smart-config parse errors so
+/// the user sees one consistent "invalid configuration" block.
+fn validate_inject(config: &Config) -> anyhow::Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+    for (rule_name, rule) in &config.network.rules {
+        if !rule.enabled {
+            continue;
+        }
+        if rule.passthrough && !rule.inject.is_empty() {
+            problems.push(format!(
+                "* `network.rules.{rule_name}` inject cannot be combined with passthrough"
+            ));
+        }
+        for var in &rule.inject {
+            let masked = config.env.get(var).is_some_and(|e| e.mask);
+            if !masked {
+                problems.push(format!(
+                    "* `network.rules.{rule_name}.inject` `{var}` must be defined in [env] with mask = true"
+                ));
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
+    }
 }
 
 /// Merge two JSON values with custom rules:

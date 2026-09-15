@@ -62,20 +62,20 @@ middleware are still MITM-decrypted but pass through unmodified.
 
 The `req` object is available in every middleware script:
 
-| Field / Method | Description |
-|---|---|
-| `req.method` | HTTP method (`"GET"`, `"POST"`, etc.) |
-| `req.path` | URL path (readable and writable) |
-| `req.host` | Authenticated destination host (the connect target, not the `Host` header) |
-| `req.headers` | Full headers table (readable and writable) |
-| `req:header(name)` | Read a single header value (use `req:header("host")` for the raw, client-sent `Host`) |
-| `req:setHeader(name, value)` | Set or overwrite a header |
-| `req:hostMatches(pattern)` | Match the connect target against a wildcard pattern |
-| `req:body()` | Read the request body (returns a Body object) |
-| `req:setBody(value)` | Replace the body (string, table, Body, or nil) |
-| `req:deny()` | Block the request with a 403 response |
-| `req:send()` | Forward the request and return the response |
-| `log(msg)` | Write to the supervisor debug log |
+| Field / Method               | Description                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------|
+| `req.method`                 | HTTP method (`"GET"`, `"POST"`, etc.)                                                 |
+| `req.path`                   | URL path (readable and writable)                                                      |
+| `req.host`                   | Authenticated destination host (the connect target, not the `Host` header)            |
+| `req.headers`                | Full headers table (readable and writable)                                            |
+| `req:header(name)`           | Read a single header value (use `req:header("host")` for the raw, client-sent `Host`) |
+| `req:setHeader(name, value)` | Set or overwrite a header                                                             |
+| `req:hostMatches(pattern)`   | Match the connect target against a wildcard pattern                                   |
+| `req:body()`                 | Read the request body (returns a Body object)                                         |
+| `req:setBody(value)`         | Replace the body (string, table, Body, or nil)                                        |
+| `req:deny()`                 | Block the request with a 403 response                                                 |
+| `req:send()`                 | Forward the request and return the response                                           |
+| `log(msg)`                   | Write to the supervisor debug log                                                     |
 
 ### Blocking a request
 
@@ -108,24 +108,24 @@ response.
 
 The response object returned by `req:send()` has a similar interface:
 
-| Field / Method | Description |
-|---|---|
-| `res.status` | HTTP status code (readable and writable) |
-| `res.headers` | Full headers table (readable and writable) |
-| `res:header(name)` | Read a single header value |
-| `res:setHeader(name, value)` | Set or overwrite a header |
-| `res:body()` | Read the response body (returns a Body object) |
-| `res:setBody(value)` | Replace the body (string, table, Body, or nil) |
+| Field / Method               | Description                                    |
+|------------------------------|------------------------------------------------|
+| `res.status`                 | HTTP status code (readable and writable)       |
+| `res.headers`                | Full headers table (readable and writable)     |
+| `res:header(name)`           | Read a single header value                     |
+| `res:setHeader(name, value)` | Set or overwrite a header                      |
+| `res:body()`                 | Read the response body (returns a Body object) |
+| `res:setBody(value)`         | Replace the body (string, table, Body, or nil) |
 
 ## Body objects
 
 Both `req:body()` and `res:body()` return a Body object with these methods:
 
-| Method | Description |
-|---|---|
-| `body:text()` | Raw bytes as a Lua string |
-| `body:json()` | Parse as JSON, return a Lua table |
-| `body:len()` or `#body` | Byte length |
+| Method                  | Description                       |
+|-------------------------|-----------------------------------|
+| `body:text()`           | Raw bytes as a Lua string         |
+| `body:json()`           | Parse as JSON, return a Lua table |
+| `body:len()` or `#body` | Byte length                       |
 
 When you call `req:setBody()` or `res:setBody()` with a Lua table, it's
 serialized as JSON automatically. The `Content-Length` header is updated to
@@ -161,6 +161,12 @@ log("request id: " .. req:header("X-Request-ID"))
 ```
 
 If any script calls `req:deny()`, the chain stops and the request is blocked.
+
+### Masked secrets and middleware
+
+[Injected](../configuration/network.md#injecting-masked-secrets) secrets
+are unmasked in request headers before the first script runs and masked
+again in response headers after the last one returns.
 
 ## Examples
 

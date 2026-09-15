@@ -1,10 +1,13 @@
 # OpenAI codex development preset
 
 [env]
-# Placeholder to use inside VM
-OPENAI_API_KEY = "real-api-key-will-be-injected"
+# The real API key stays on the host: the sandbox sees a same-length random
+# surrogate, and the `inject` rule below swaps the real value into request
+# headers at the host boundary.
+OPENAI_API_KEY = { value = "${OPENAI_API_KEY}", mask = true }
 
 [network.rules.codex]
+inject = ["OPENAI_API_KEY"]
 allow = [
     "api.openai.com:443",
     "auth.openai.com:443",
@@ -14,13 +17,3 @@ allow = [
 source = "~/.airlock/codex"
 target = "~/.codex"
 missing = "create-dir"
-
-# Inject real api key at host middleware
-[network.middleware.codex-api-key]
-target = ["api.openai.com:443"]
-env.API_KEY = "${OPENAI_API_KEY}"
-script = """
-if env.API_KEY then
-  req:setHeader("Authorization", "Bearer " .. env.API_KEY)
-end
-"""

@@ -66,9 +66,10 @@ Edit the project's `airlock.toml` and add the `claude-code` preset. It:
 * Adds network
   [allow rules](https://milankinen.github.io/airlock/configuration/network.html)
   for the Anthropic APIs.
-* Configures an
-  [HTTP middleware](https://milankinen.github.io/airlock/advanced/network-scripting.html)
-  that injects your API token into Claude's requests on the host side —
+* [Masks](https://milankinen.github.io/airlock/configuration/env.html#masking)
+  your API token — the sandbox only sees a random surrogate — and
+  [injects](https://milankinen.github.io/airlock/configuration/network.html#injecting-masked-secrets)
+  the real value into Claude's requests on the host side —
   **your token is never exposed to the sandbox**.
 * Creates Claude placeholder settings under `~/.airlock/claude` and
   [mounts](https://milankinen.github.io/airlock/configuration/mounts.html)
@@ -96,7 +97,7 @@ image = "docker/sandbox-templates:claude-code"
 
 ### 4. Provide the Claude Code token
 
-The network middleware expects the Claude authentication token in the
+The preset expects the Claude authentication token in the
 `CLAUDE_CODE_OAUTH_TOKEN` environment variable. You can obtain one by
 running `claude setup-token`.
 

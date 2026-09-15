@@ -167,17 +167,22 @@ async fn run(
     vault: Vault,
     mut runtime: impl Runtime,
 ) -> anyhow::Result<i32> {
-    let project = project::lock(host_cwd, config, project_cwd, vault)?;
+    // `lock` also resolves `[env]` (host substitution + surrogates for
+    // masked entries), so a missing variable fails before the image pull.
+    // That is a configuration error like the ones reported above, so it
+    // keeps their exit code rather than the generic runtime failure.
+    let project = match project::lock(host_cwd, config, project_cwd, vault) {
+        Ok(p) => p,
+        Err(e) if e.downcast_ref::<project::EnvError>().is_some() => {
+            cli::error!("Config error: {e:#}");
+            return Ok(2);
+        }
+        Err(e) => return Err(e),
+    };
     print_preparing(&project);
 
     let image = oci::prepare(&project).await?;
-    let container_home = match oci::effective_container_home(&project, &image) {
-        Ok(h) => h,
-        Err(e) => {
-            cli::error!("{e:#}");
-            return Ok(2);
-        }
-    };
+    let container_home = oci::effective_container_home(&project, &image);
     let network = network::setup(&project, &container_home)?;
 
     print_mounts_and_rules(&project);
@@ -383,6 +388,14 @@ fn print_preparing(project: &project::Project) {
 /// Verbose-only: list enabled mounts, network rules, socket forwards,
 /// and TCP port forwards grouped by kind.
 fn print_mounts_and_rules(project: &project::Project) {
+    if !project.env.is_empty() {
+        cli::verbose!(
+            "  {} env: {} vars ({} masked)",
+            cli::bullet(),
+            project.env.len(),
+            project.env.masked_count()
+        );
+    }
     let enabled_mounts: Vec<_> = project
         .config
         .mounts
@@ -410,8 +423,13 @@ fn print_mounts_and_rules(project: &project::Project) {
             enabled_rules.len()
         );
         for (key, rule) in &enabled_rules {
+            let inject = if rule.inject.is_empty() {
+                String::new()
+            } else {
+                format!(" inject {}", rule.inject.len())
+            };
             cli::verbose!(
-                "      {key}: allow {} deny {}",
+                "      {key}: allow {} deny {}{inject}",
                 rule.allow.len(),
                 rule.deny.len()
             );

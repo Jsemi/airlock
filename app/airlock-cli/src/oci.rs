@@ -23,7 +23,8 @@ use crate::project::Project;
 use crate::{cache, cli};
 
 /// Everything needed to configure the container process (returned by `prepare`).
-/// Mount resolution, disk setup, and command/env overrides happen in `vm::start`.
+/// Mount resolution, disk setup, and command/env overrides happen in `vm::start`
+/// (env via the resolved `SandboxEnv`).
 ///
 /// Serialized to disk at `images/<digest>` wrapped in [`CachedImage`]; the
 /// same file is hardlinked to `<sandbox>/image` as the GC liveness signal.
@@ -56,7 +57,7 @@ pub struct OciImage {
     /// No args.args overrides (those go in vm::start).
     pub cmd: Vec<String>,
     /// Base defaults (PATH/TERM/HOME) + image env.
-    /// No sandbox.config.env overrides (those go in vm::start).
+    /// No `[env]` overrides (those are layered in `vm::start` from `SandboxEnv`).
     pub env: Vec<String>,
 }
 
@@ -408,22 +409,19 @@ fn build_oci_image(
 /// Resolve the home directory that `~` should expand to for paths the
 /// sandbox sees. Falls back to the OCI image's user record when the
 /// project doesn't set `HOME` in `[env]`; otherwise honours the user's
-/// override (with vault `${VAR}` substitution, same as every other
-/// `[env]` value).
+/// override as the guest will see it (already `${VAR}`-substituted by
+/// [`crate::project::SandboxEnv::resolve`] in `project::lock`).
 ///
 /// Without this, a `target = "~/foo"` mount with `[env].HOME = "/x"`
 /// would expand the `~` against the image's home (`/root`) but the
 /// sandbox shell would resolve `$HOME` as `/x` — paths land in the
 /// wrong place and tools that re-tilde a result of the mount mismatch
 /// what's actually mounted.
-pub fn effective_container_home(project: &Project, image: &OciImage) -> anyhow::Result<String> {
-    if let Some(template) = project.config.env.get("HOME") {
-        return project
-            .vault
-            .subst(template)
-            .map_err(|e| anyhow::anyhow!("env.HOME: {e}"));
-    }
-    Ok(image.container_home.clone())
+pub fn effective_container_home(project: &Project, image: &OciImage) -> String {
+    project
+        .env
+        .guest_value("HOME")
+        .map_or_else(|| image.container_home.clone(), str::to_string)
 }
 
 /// Wrap a command vector for execution inside a login shell.

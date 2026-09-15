@@ -7,16 +7,14 @@ access to the GitHub endpoints Copilot actually uses.
 
 ## What the preset does
 
-The sandbox sees a placeholder token, and airlock swaps in the real
-token at the host boundary — only on the specific paths Copilot
-uses.
+The sandbox sees a same-length random surrogate in
+`COPILOT_GITHUB_TOKEN`, and airlock swaps in the real token at the
+host boundary.
 
-- **Your token stays on the host.** Copilot requests are intercepted
-  on `api.github.com` and `*.githubcopilot.com`, and the real
-  `Authorization` header is injected there at host side. On
-  `api.github.com` the injection is path-scoped to `/copilot/*` and
-  `/copilot_internal/*`, so any other GitHub API call an agent might
-  make will not receive the Copilot token.
+- **Your token stays on the host.** The variable is
+  [masked](../configuration/env.md#masking) and the `copilot-cli`
+  rule [injects](../configuration/network.md#injecting-masked-secrets)
+  the real value into request headers to the hosts it allows.
 - **Only Copilot endpoints are reachable** (`github.com`,
   `api.github.com`, and `*.githubcopilot.com`). Everything else stays
   blocked by your deny-by-default policy.
@@ -53,7 +51,7 @@ Create a [fine-grained personal access token][new-pat] with the
 airlock secrets add COPILOT_GITHUB_TOKEN
 ```
 
-Inside the sandbox, Copilot CLI sees a placeholder value in
+Inside the sandbox, Copilot CLI sees a surrogate value in
 `COPILOT_GITHUB_TOKEN` — no `/login` step is needed. Airlock
 intercepts outgoing API requests at the host boundary and swaps in
 the real token there. The actual credential never enters the sandbox.

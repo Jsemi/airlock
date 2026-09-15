@@ -1,7 +1,8 @@
 use super::http;
 use super::middleware::LogFn;
-use super::target::{MiddlewareTarget, NetworkTarget};
+use super::target::{InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget};
 use crate::config::config::Network;
+use crate::project::SandboxEnv;
 use crate::vault::Vault;
 
 /// Rule targets extracted from enabled rules.
@@ -84,6 +85,44 @@ pub fn resolve_middleware(
     Ok(targets)
 }
 
+/// Resolve `inject` lists from enabled rules into targets carrying the
+/// masked secrets. Config loading guarantees every name is a masked `[env]`
+/// entry and that no injecting rule is `passthrough`; `project::lock`
+/// checks the values are injectable. This still errors (rather than
+/// panics) on a missing entry.
+pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec<InjectTarget>> {
+    let mut targets = Vec::new();
+
+    for (rule_name, rule) in &network.rules {
+        if !rule.enabled || rule.inject.is_empty() {
+            continue;
+        }
+
+        let mut secrets: Vec<InjectedSecret> = Vec::with_capacity(rule.inject.len());
+        for name in &rule.inject {
+            let Some(secret) = env.masked(name) else {
+                anyhow::bail!(
+                    "network.rules.{rule_name}.inject: `{name}` must be defined in [env] with mask = true"
+                );
+            };
+            if !secrets.iter().any(|s| s.name == *name) {
+                secrets.push(InjectedSecret::new(secret.clone()));
+            }
+        }
+
+        for target_str in &rule.allow {
+            let (host, port) = parse_target(target_str);
+            targets.push(InjectTarget {
+                host: host.to_string(),
+                port: port.and_then(|p| p.parse::<u16>().ok()),
+                secrets: secrets.clone(),
+            });
+        }
+    }
+
+    Ok(targets)
+}
+
 /// Derive guest → host port forward mappings from config.
 /// Returns `(guest_port, host_port)` pairs from all enabled port forward groups.
 pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
@@ -154,6 +193,7 @@ mod tests {
 
     use super::*;
     use crate::config::config::{self, NetworkRule, Policy};
+    use crate::project::MaskedSecret;
 
     fn rule(allow: &[&str], passthrough: bool) -> NetworkRule {
         NetworkRule {
@@ -161,6 +201,7 @@ mod tests {
             allow: allow.iter().map(|s| (*s).to_string()).collect(),
             deny: vec![],
             passthrough,
+            inject: vec![],
         }
     }
 
@@ -207,6 +248,85 @@ mod tests {
         assert!(!resolved.passthrough[0].matches("api.example.com", 443));
     }
 
+    fn secret(name: &str, real: &str) -> MaskedSecret {
+        MaskedSecret {
+            name: name.to_string(),
+            real: real.to_string(),
+            surrogate: "x".repeat(real.chars().count()),
+        }
+    }
+
+    fn net_with(rules: Vec<(&str, NetworkRule)>) -> config::Network {
+        config::Network {
+            policy: Policy::DenyByDefault,
+            rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            middleware: BTreeMap::default(),
+            ports: BTreeMap::default(),
+            sockets: BTreeMap::default(),
+        }
+    }
+
+    fn inject_rule(allow: &[&str], inject: &[&str], passthrough: bool) -> NetworkRule {
+        NetworkRule {
+            enabled: true,
+            allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            deny: vec![],
+            passthrough,
+            inject: inject.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_inject_builds_one_target_per_allow_pattern() {
+        let env = SandboxEnv::from_secrets(vec![
+            secret("A", "aaaaaaaaaaaa"),
+            secret("B", "bbbbbbbbbbbb"),
+        ]);
+        let net = net_with(vec![
+            (
+                "api",
+                inject_rule(
+                    &["api.example.com:443", "*.example.org"],
+                    &["A", "B", "A"],
+                    false,
+                ),
+            ),
+            ("plain", inject_rule(&["plain.example.com"], &[], false)),
+        ]);
+        let targets = resolve_inject(&net, &env).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].matches("api.example.com", 443));
+        assert!(!targets[0].matches("api.example.com", 80));
+        assert!(targets[1].matches("x.example.org", 1234));
+        // Duplicate names collapse; both patterns share the same secrets.
+        assert_eq!(targets[0].secrets.len(), 2);
+        assert!(InjectedSecret::ptr_eq(
+            &targets[0].secrets[0],
+            &targets[1].secrets[0]
+        ));
+    }
+
+    #[test]
+    fn resolve_inject_skips_disabled_rules() {
+        let env = SandboxEnv::from_secrets(vec![secret("A", "aaaaaaaaaaaa")]);
+        let mut rule = inject_rule(&["api.example.com"], &["A"], false);
+        rule.enabled = false;
+        let net = net_with(vec![("api", rule)]);
+        assert!(resolve_inject(&net, &env).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_inject_rejects_unknown_name() {
+        let env = SandboxEnv::from_secrets(vec![]);
+        let net = net_with(vec![(
+            "api",
+            inject_rule(&["api.example.com"], &["A"], false),
+        )]);
+        let err = resolve_inject(&net, &env).unwrap_err().to_string();
+        assert!(err.contains("network.rules.api.inject"), "got: {err}");
+        assert!(err.contains("`A`"), "got: {err}");
+    }
+
     #[test]
     fn disabled_passthrough_rule_is_skipped() {
         let mut rules = BTreeMap::new();
@@ -217,6 +337,7 @@ mod tests {
                 allow: vec!["db.example.com".to_string()],
                 deny: vec![],
                 passthrough: true,
+                inject: vec![],
             },
         );
         let net = config::Network {

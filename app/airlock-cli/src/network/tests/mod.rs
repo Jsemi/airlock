@@ -1,5 +1,6 @@
 mod helpers;
 mod test_http;
+mod test_inject;
 mod test_middleware;
 mod test_tcp;
 mod test_tls;
