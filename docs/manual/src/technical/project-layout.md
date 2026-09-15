@@ -66,7 +66,7 @@ extract it only once. Platform is fixed to `linux/arm64` (matching
 the VM architecture).
 
 Each `images/<digest>` entry is a single JSON file carrying the
-serialized `OciImage` (wrapped in a `{"schema":"v1", …}` envelope for
+serialized `OciImage` (wrapped in a `{"schema":"v2", …}` envelope for
 forward-compatible schema evolution). It is written atomically via
 `.tmp` rename and then hard-linked into the sandbox at
 `sandbox/image`; a link count greater than 1 on the cached file means

@@ -59,6 +59,14 @@ pub struct OciImage {
     /// Base defaults (PATH/TERM/HOME) + image env.
     /// No `[env]` overrides (those are layered in `vm::start` from `SandboxEnv`).
     pub env: Vec<String>,
+    /// The raw `USER` string from the image config (`""` when the image
+    /// declares none). `None` marks a file written before named users were
+    /// resolved through the image's `/etc/passwd`
+    /// (<https://github.com/milankinen/airlock/pull/12>): such a file may
+    /// carry root `uid`/`gid` for an image that asked for a non-root user, so
+    /// [`prepare`] re-verifies it against a fresh resolution before use.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Resolve, download, and prepare the OCI image for the sandbox.
@@ -71,6 +79,11 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // complete on disk and still the image the config asks for by name.
     let cached = read_ready_image(&sandbox_image).filter(|img| img.name == *image_name);
 
+    // A file without `user` predates named-USER resolution and may carry a
+    // wrong uid/gid — it has to be re-verified below, so it never takes the
+    // fast path and never serves as a digest-keyed cache hit.
+    let legacy = cached.as_ref().is_some_and(|img| img.user.is_none());
+
     // Fast path: reuse the cached image and skip the network round-trip that
     // resolves tag → digest.
     //
@@ -79,6 +92,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // is exempt either way: it names one immutable image, so a matching name
     // already implies a matching digest and there is nothing to detect.
     if let Some(img) = cached.clone()
+        && !legacy
         && (image_cfg.pull_policy == PullPolicy::IfNotPresent
             || image_cfg.pinned_digest().is_some())
     {
@@ -110,6 +124,17 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             return use_cached_image(project, &sandbox_image, img);
         }
     };
+
+    // Same digest, but the cached metadata was baked by the old `USER`
+    // resolution: re-derive uid/gid from the fresh config and either stamp
+    // the file as verified or, if the sandbox has been running as the wrong
+    // user, refuse to start it.
+    if let Some(img) = cached
+        .as_ref()
+        .filter(|i| i.user.is_none() && i.image_id == image.digest)
+    {
+        verify_legacy_user(img, &image)?;
+    }
 
     // Check if image changed before downloading.
     let digest_changed = stored_digest
@@ -358,10 +383,8 @@ fn build_oci_image(
     }
 
     let cfg = image_config.config.as_ref();
-    let (uid, gid) = resolve_user(
-        &ordered_layers,
-        cfg.and_then(|c| c.user.as_deref()).unwrap_or(""),
-    )?;
+    let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("");
+    let (uid, gid) = resolve_user(&ordered_layers, user)?;
     let container_home = lookup_home_dir(&ordered_layers, uid)?;
 
     // Resolve container command: entrypoint + cmd merged
@@ -401,6 +424,7 @@ fn build_oci_image(
         container_home,
         uid,
         gid,
+        user: Some(user.to_string()),
         cmd,
         env,
     })
@@ -571,6 +595,87 @@ fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
     Ok(choice)
 }
 
+/// Outcome of re-checking a legacy cache file's uid/gid against a fresh
+/// resolution of the image's `USER`.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyUser {
+    /// The stored uid/gid are what the fixed resolution produces.
+    Verified,
+    /// Same uid, different primary group (`USER 1000` used to get gid 0).
+    /// Existing files still belong to the same owner, so the cache entry is
+    /// repaired in place instead of throwing the sandbox away.
+    GidOnly { gid: u32 },
+    /// The sandbox has been running as the wrong user — typically root for
+    /// `USER node` — and its disk holds state owned by that user.
+    UidMismatch { uid: u32, gid: u32 },
+}
+
+/// Re-derive uid/gid for a legacy cache file (one without `user`) from the
+/// current `USER` string, using the layers the file already references.
+fn check_legacy_user(stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser> {
+    let (uid, gid) = resolve_user(&stored.image_layers, user)?;
+    Ok(if uid != stored.uid {
+        LegacyUser::UidMismatch { uid, gid }
+    } else if gid != stored.gid {
+        LegacyUser::GidOnly { gid }
+    } else {
+        LegacyUser::Verified
+    })
+}
+
+/// The `USER` string of a freshly resolved image. Registry resolution
+/// already carries the config; Docker resolution defers it to the export,
+/// so ask the daemon directly.
+fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
+    match &resolved.source {
+        ImageSource::Registry(_) => Ok(resolved
+            .config
+            .config
+            .as_ref()
+            .and_then(|c| c.user.clone())
+            .unwrap_or_default()),
+        ImageSource::Docker { .. } => docker::image_user(&resolved.digest),
+    }
+}
+
+/// `stored` is this sandbox's cached image, written before named `USER`
+/// resolution existed and still naming the digest `resolved` just produced.
+/// Stamp it verified (or repair its gid) when the fixed resolution agrees;
+/// otherwise fail with an explanation and point at `airlock rm` — after the
+/// removal the next start finds no sandbox image, and `ensure_image` rebuilds
+/// the shared entry rather than reusing the legacy one.
+fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Result<()> {
+    let user = resolved_user(resolved)?;
+    let mut fixed = stored.clone();
+    fixed.user = Some(user.clone());
+    match check_legacy_user(stored, &user)? {
+        LegacyUser::Verified => {}
+        LegacyUser::GidOnly { gid } => {
+            cli::log!(
+                "  {} container gid corrected {} → {gid}",
+                cli::bullet(),
+                stored.gid
+            );
+            fixed.gid = gid;
+        }
+        LegacyUser::UidMismatch { uid, gid } => {
+            anyhow::bail!(
+                "This sandbox was created by an airlock version that resolved the \
+                 image's `USER {user}` to uid {}, gid {} instead of uid {uid}, gid {gid}, \
+                 so everything inside it has been running as the wrong user. That bug \
+                 is fixed (https://github.com/milankinen/airlock/pull/12), but the \
+                 sandbox's disk already holds state owned by the wrong user, so the \
+                 sandbox must be re-created: run `airlock rm` and start again.",
+                stored.uid,
+                stored.gid
+            );
+        }
+    }
+    // Rewrite the shared cache entry; `prepare` re-links the sandbox copy to
+    // the new file via `ensure_image_hardlink`.
+    write_cached_image(&crate::cache::image_path(&stored.image_id)?, &fixed)
+}
+
 /// Full image resolution (with config).
 async fn resolve_image(
     image_cfg: &crate::config::config::ImageRef,
@@ -714,7 +819,7 @@ async fn ensure_image(
     // image and all its layers are still on disk. Skip the source-specific
     // pull entirely. We refresh the stored name so the per-sandbox fast
     // path in `prepare()` (which matches on name) sees the current tag.
-    if let Some(mut cached) = read_ready_image(&image_path) {
+    if let Some(mut cached) = read_ready_image(&image_path).filter(|c| c.user.is_some()) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
             write_cached_image(&image_path, &cached)?;
@@ -1035,6 +1140,7 @@ mod tests {
             gid: 0,
             cmd: vec!["/bin/sh".to_string()],
             env: vec![],
+            user: Some(String::new()),
         }
     }
 
@@ -1109,6 +1215,87 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("etc/group"), "root:x:0:\nnode:x:1000:\n").unwrap();
         key
+    }
+
+    /// Cache files written before `user` existed must still load — as
+    /// legacy entries with `user == None` — so `prepare` can verify them
+    /// instead of rejecting them or trusting them blindly.
+    #[test]
+    fn cache_file_without_user_loads_as_legacy() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let path = cache::image_path("sha256:legacy").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "schema": "v2",
+            "image_id": "sha256:legacy",
+            "name": "node:22",
+            "image_layers": [cache::layer_key("sha256:L1")],
+            "container_home": "/root",
+            "uid": 0,
+            "gid": 0,
+            "cmd": ["/bin/sh"],
+            "env": [],
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(read_cached_image(&path).unwrap().user, None);
+
+        write_cached_image(&path, &sample_image("sha256:legacy", &["sha256:L1"])).unwrap();
+        assert_eq!(read_cached_image(&path).unwrap().user, Some(String::new()));
+    }
+
+    /// A legacy entry baked by the fallback-to-root resolution is only a
+    /// problem when the uid it stored differs from what `USER` really means.
+    /// A wrong primary group alone is repairable; a wrong uid is not.
+    #[test]
+    fn legacy_user_check_distinguishes_root_fallback_from_gid_drift() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let layer = make_layer_with_passwd("sha256:legacy-passwd");
+        let mut stored = sample_image("sha256:legacy", &[]);
+        stored.image_layers = vec![layer];
+        stored.user = None;
+
+        // Root image, or one that never declared a user: nothing to fix.
+        assert_eq!(
+            check_legacy_user(&stored, "").unwrap(),
+            LegacyUser::Verified
+        );
+        assert_eq!(
+            check_legacy_user(&stored, "root").unwrap(),
+            LegacyUser::Verified
+        );
+        // `USER node` fell back to root before the fix.
+        assert_eq!(
+            check_legacy_user(&stored, "node").unwrap(),
+            LegacyUser::UidMismatch {
+                uid: 1000,
+                gid: 1000
+            }
+        );
+
+        // `USER 1000` got the right uid but gid 0 instead of the primary group.
+        stored.uid = 1000;
+        assert_eq!(
+            check_legacy_user(&stored, "1000").unwrap(),
+            LegacyUser::GidOnly { gid: 1000 }
+        );
+        stored.gid = 1000;
+        assert_eq!(
+            check_legacy_user(&stored, "1000").unwrap(),
+            LegacyUser::Verified
+        );
     }
 
     fn config_with_user(user: &str) -> OciConfig {

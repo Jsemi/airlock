@@ -79,6 +79,24 @@ pub fn image_arch(image_id: &str) -> Option<String> {
     if arch.is_empty() { None } else { Some(arch) }
 }
 
+/// Returns the `USER` a local image's config declares (`""` when none).
+/// Fails when the daemon cannot be asked: the caller must not guess.
+pub fn image_user(image_id: &str) -> anyhow::Result<String> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Config.User}}", image_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run docker image inspect: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "docker image inspect {image_id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Returns the registry digests the daemon recorded for a local image, i.e.
 /// the `RepoDigests` entries with their `<repo>@` prefix stripped.
 ///
