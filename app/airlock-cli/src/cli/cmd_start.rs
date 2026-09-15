@@ -42,6 +42,9 @@ pub struct StartArgs {
     /// Open TUI monitoring control panel (tabbed sandbox + network view)
     #[arg(short = 'm', long)]
     pub monitor: bool,
+    /// Override the `[network] policy` from the config for this run only
+    #[arg(long, value_name = "POLICY")]
+    pub network: Option<config::config::Policy>,
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
@@ -103,13 +106,20 @@ pub async fn main(
         cli::log!("Created airlock.toml in {}", host_cwd.display());
     }
 
-    let config = match config::load(&host_cwd) {
+    let mut config = match config::load(&host_cwd) {
         Ok(c) => c,
         Err(e) => {
             cli::error!("Config error: {e:#}");
             return Ok(2);
         }
     };
+    // `--network` replaces the policy only; rules, middleware, ports, and
+    // sockets from the config still apply. Everything downstream sees the
+    // overridden config as if it came from the file.
+    if let Some(policy) = args.network {
+        info!("network policy overridden by --network: {}", policy.label());
+        config.network.policy = policy;
+    }
 
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
@@ -393,7 +403,7 @@ fn print_mounts_and_rules(project: &project::Project) {
         .filter(|(_, r)| r.enabled)
         .collect();
     if !enabled_rules.is_empty() {
-        let policy = format!("{:?}", project.config.network.policy).to_lowercase();
+        let policy = project.config.network.policy.label();
         cli::verbose!(
             "  {} network rules: {} (policy: {policy})",
             cli::bullet(),

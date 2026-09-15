@@ -264,7 +264,20 @@ pub mod config {
 
     /// Network policy — controls whether connections are allowed or denied
     /// before rules are evaluated.
-    #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+    ///
+    /// Doubles as the value type of `airlock start --network <POLICY>`; the
+    /// `clap` value names match the on-disk kebab-case form.
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        Default,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        clap::ValueEnum,
+    )]
     #[serde(rename_all = "kebab-case")]
     pub enum Policy {
         /// Skip rules, allow all connections (default).
@@ -276,6 +289,18 @@ pub mod config {
         AllowByDefault,
         /// Deny connections unless explicitly allowed by a rule.
         DenyByDefault,
+    }
+
+    impl Policy {
+        /// Kebab-case name as written in `airlock.toml` and on the CLI.
+        pub fn label(self) -> &'static str {
+            match self {
+                Policy::AllowAlways => "allow-always",
+                Policy::DenyAlways => "deny-always",
+                Policy::AllowByDefault => "allow-by-default",
+                Policy::DenyByDefault => "deny-by-default",
+            }
+        }
     }
 
     impl WellKnown for Policy {

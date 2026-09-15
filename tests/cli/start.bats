@@ -58,3 +58,15 @@ has_kvm_or_not_linux() {
     assert_failure 1
     assert_output_contains "KVM not available"
 }
+
+@test "start --network overrides config policy in verbose rules summary" {
+    has_kvm_or_not_linux || skip "no KVM access"
+    write_config '[network]
+policy = "deny-by-default"
+
+[network.rules.example]
+allow = ["example.com:443"]'
+    run_airlock start --verbose --network allow-always
+    assert_output_not_contains "Config error"
+    assert_output_contains "(policy: allow-always)"
+}

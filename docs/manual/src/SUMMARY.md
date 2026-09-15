@@ -21,6 +21,7 @@
 - [Tips and tricks](./tips.md)
     - [Pairing with mise](./tips/mise.md)
     - [Vibe coding configuration](./tips/vibe-config.md)
+    - [Open-network bootstrap](./tips/init-with-open-network.md)
     - [Docker inside the VM](./tips/docker.md)
     - [Experimental: Claude hooks](./tips/experimental-claude-hooks.md)
 - [Advanced usage](./advanced.md)

@@ -8,6 +8,10 @@ save you some time.
 alongside airlock — installing airlock as a mise tool, building local Docker
 images for sandboxes, and loading secrets per task.
 
+[Open-network bootstrap](./tips/init-with-open-network.md)
+shows how to run a one-off init script with `airlock start --network` while
+keeping `deny-by-default` in `airlock.toml`.
+
 [Docker inside the VM](./tips/docker.md) covers two approaches for running
 Docker containers inside an airlock sandbox: forwarding the host Docker
 socket (easy but comes with caveats) and running a full Docker engine inside

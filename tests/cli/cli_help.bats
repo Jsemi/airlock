@@ -57,3 +57,17 @@ load helpers
     run_airlock start --bogus
     assert_failure 2
 }
+
+@test "airlock start --help lists --network policy values" {
+    run_airlock start --help
+    assert_success
+    assert_output_contains "--network <POLICY>"
+    assert_output_contains "allow-always"
+    assert_output_contains "deny-by-default"
+}
+
+@test "airlock start --network with unknown policy fails" {
+    run_airlock start --network allow-all
+    assert_failure 2
+    assert_output_contains "invalid value 'allow-all'"
+}

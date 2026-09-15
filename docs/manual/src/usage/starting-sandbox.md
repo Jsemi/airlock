@@ -106,6 +106,28 @@ resolution = "registry"
 insecure = true
 ```
 
+## Network policy override
+
+The `--network` flag replaces the `[network] policy` value from the config
+for a single run. It accepts the same four values as the config field:
+`allow-always`, `deny-always`, `allow-by-default`, and `deny-by-default`.
+
+```bash
+airlock start --network=allow-always -- ./init.sh
+```
+
+Only the policy is overridden — rules, middleware, port forwards, and socket
+forwards from the config still apply. Nothing is written back to
+`airlock.toml`, and the next `airlock start` without the flag uses the
+configured policy again. With `--verbose`, the network rules summary shows
+the effective policy, and the override is also recorded in
+`.airlock/airlock.log`.
+
+This is mainly useful for one-off bootstrap commands that need broader
+network access than the day-to-day session; see
+[Open-network bootstrap](../tips/init-with-open-network.md)
+for a worked example.
+
 ## Monitor dashboard
 
 Pass `--monitor` (`-m`) to open a tabbed TUI control panel alongside the
