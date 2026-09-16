@@ -22,6 +22,11 @@ use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 use crate::{cache, cli};
 
+/// Largest `etc/passwd` / `etc/group` accepted from a layer. Real files are
+/// a few KB; anything bigger is treated as having no records rather than
+/// read whole, so an image cannot dictate how much memory `prepare` uses.
+const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
+
 /// Everything needed to configure the container process (returned by `prepare`).
 /// Mount resolution, disk setup, and command/env overrides happen in `vm::start`
 /// (env via the resolved `SandboxEnv`).
@@ -511,10 +516,10 @@ fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)>
         (0, None)
     } else if let Ok(uid) = user_part.parse::<u32>() {
         let record = passwd_record(&|f| f[2].parse::<u32>().ok() == Some(uid))?;
-        (uid, record.map(|(_, gid)| gid))
+        (uid, record.value.map(|(_, gid)| gid))
     } else {
         let (uid, gid) = passwd_record(&|f| f[0] == user_part)?
-            .ok_or_else(|| anyhow::anyhow!("no user {user_part} found in any layer /etc/passwd"))?;
+            .ok_or_else(|| format!("no user {user_part} found in any layer /etc/passwd"))?;
         (uid, Some(gid))
     };
 
@@ -540,7 +545,7 @@ fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
             None
         }
     })?
-    .ok_or_else(|| anyhow::anyhow!("no group {group} found in any layer /etc/group"))
+    .ok_or_else(|| format!("no group {group} found in any layer /etc/group"))
 }
 
 enum ImageChangeAction {
@@ -1071,7 +1076,8 @@ fn format_size(bytes: i64) -> String {
 
 /// Walk `rel_path` (e.g. `etc/passwd`) through the per-layer cache, topmost
 /// first, splitting each line on `:` and returning the first record for
-/// which `pick` yields a value.
+/// which `pick` yields a value — together with every layer copy that was
+/// refused rather than read, and why.
 ///
 /// Reads from individual layer trees under `~/.cache/airlock/oci/layers/` —
 /// the host has no merged rootfs to consult for this lookup. Whiteouts
@@ -1086,20 +1092,151 @@ fn lookup_layer_record<T>(
     layer_keys: &[String],
     rel_path: &str,
     pick: impl Fn(&[&str]) -> Option<T>,
-) -> anyhow::Result<Option<T>> {
+) -> anyhow::Result<Lookup<T>> {
+    let mut ignored = Vec::new();
     for key in layer_keys {
-        let path = cache::layer_dir(key)?.join(rel_path);
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+        let content = match read_layer_file(&cache::layer_dir(key)?, rel_path) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(Refused { why, suspicious }) => {
+                if suspicious {
+                    tracing::warn!("{rel_path} in layer {key}: {why}, ignoring");
+                } else {
+                    tracing::debug!("{rel_path} in layer {key}: {why}, ignoring");
+                }
+                ignored.push(format!("{rel_path} in layer {key}: {why}"));
+                continue;
+            }
         };
         for line in content.lines() {
             let fields: Vec<&str> = line.split(':').collect();
             if let Some(value) = pick(&fields) {
-                return Ok(Some(value));
+                return Ok(Lookup {
+                    value: Some(value),
+                    ignored,
+                });
             }
         }
     }
-    Ok(None)
+    Ok(Lookup {
+        value: None,
+        ignored,
+    })
+}
+
+/// Outcome of [`lookup_layer_record`]: the first match, plus the layer
+/// copies that were refused instead of read. The refusals only matter when
+/// nothing matched — then they are the difference between "this image is
+/// broken" and "this image was rejected", so they go into the error.
+struct Lookup<T> {
+    value: Option<T>,
+    ignored: Vec<String>,
+}
+
+impl<T> Lookup<T> {
+    /// Like `Option::ok_or_else`, but the error also lists the refused
+    /// layer files so the user learns *why* nothing resolved.
+    fn ok_or_else(self, not_found: impl FnOnce() -> String) -> anyhow::Result<T> {
+        if let Some(value) = self.value {
+            return Ok(value);
+        }
+        let msg = if self.ignored.is_empty() {
+            not_found()
+        } else {
+            format!("{} (ignored: {})", not_found(), self.ignored.join("; "))
+        };
+        Err(anyhow::anyhow!(msg))
+    }
+}
+
+/// Read `rel_path` from one layer tree, refusing anything that would take
+/// the read outside that tree.
+///
+/// Tar extraction keeps a layer's symlinks verbatim because they are meant
+/// to resolve inside the *guest* — but here they resolve on the host. An
+/// image can therefore ship `etc/passwd -> /etc/passwd` (read the host's
+/// users), `-> /dev/zero` (read until OOM) or `etc -> /` (both). Symlinks
+/// that stay within the layer (`etc/passwd -> ../usr/lib/passwd`) are
+/// legitimate and still resolve. Anything refused reads as "no records in
+/// this layer", so the walk falls through to the next layer the same way it
+/// does for a whiteout — but unlike a whiteout the refusal is returned as
+/// `Err`, so it can be reported if nothing else resolves. `Ok(None)` means
+/// the layer simply has no such file.
+fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, Refused> {
+    use std::io::Read;
+
+    let root = std::fs::canonicalize(layer_dir)
+        .map_err(|e| Refused::suspicious(format!("cannot resolve layer dir: {e}")))?;
+
+    // Walk one component at a time. `lstat` refuses to follow only the
+    // *last* component, so checking `etc/passwd` in one go would traverse
+    // `etc -> /` and, if the host happens to lack `/passwd`, report the
+    // layer as merely not having the file. Every symlink on the way gets
+    // the same stay-inside test as the final one.
+    let mut path = layer_dir.to_path_buf();
+    for component in rel_path.split('/') {
+        path.push(component);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return Ok(None);
+        };
+        if meta.file_type().is_symlink() {
+            let target = std::fs::canonicalize(&path).map_err(|e| {
+                Refused::unresolved(format!(
+                    "symlink target cannot be resolved in this layer: {e}"
+                ))
+            })?;
+            if !target.starts_with(&root) {
+                return Err(Refused::suspicious(format!(
+                    "symlink resolves outside the layer ({})",
+                    target.display()
+                )));
+            }
+        }
+    }
+
+    let meta = std::fs::metadata(&path).map_err(|e| Refused::suspicious(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(Refused::suspicious("not a regular file".to_string()));
+    }
+    if meta.len() > MAX_LAYER_RECORD_FILE {
+        return Err(Refused::suspicious(format!(
+            "{} bytes, larger than the {MAX_LAYER_RECORD_FILE} byte limit",
+            meta.len()
+        )));
+    }
+    let mut content = String::new();
+    std::fs::File::open(&path)
+        .map_err(|e| Refused::suspicious(e.to_string()))?
+        .take(MAX_LAYER_RECORD_FILE)
+        .read_to_string(&mut content)
+        .map_err(|e| Refused::suspicious(e.to_string()))?;
+    Ok(Some(content))
+}
+
+/// Why a layer file was not read. `suspicious` separates what an honest
+/// image never does (a symlink escaping the layer, a directory or device
+/// where a file should be, an oversized file) from a symlink whose target
+/// lives in another layer, which is a limit of reading per-layer trees and
+/// not worth a warning every prepare.
+struct Refused {
+    why: String,
+    suspicious: bool,
+}
+
+impl Refused {
+    fn suspicious(why: String) -> Self {
+        Self {
+            why,
+            suspicious: true,
+        }
+    }
+
+    fn unresolved(why: String) -> Self {
+        Self {
+            why,
+            suspicious: false,
+        }
+    }
 }
 
 /// Look up a user's home directory by uid in the image's `/etc/passwd`.
@@ -1107,9 +1244,7 @@ fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
     lookup_layer_record(layer_keys, "etc/passwd", |f| {
         (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
     })?
-    .ok_or_else(|| {
-        anyhow::anyhow!("no home directory found for uid {uid} in any layer /etc/passwd")
-    })
+    .ok_or_else(|| format!("no home directory found for uid {uid} in any layer /etc/passwd"))
 }
 
 #[cfg(test)]
@@ -1215,6 +1350,229 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("etc/group"), "root:x:0:\nnode:x:1000:\n").unwrap();
         key
+    }
+
+    /// Point a layer's `etc/passwd` (or its whole `etc` directory) at a
+    /// path outside the layer tree — where a malicious image can aim a
+    /// symlink at the host's `/etc/passwd`, `/dev/zero`, or a FIFO.
+    fn make_layer_with_passwd_symlink(digest: &str, link: &Path, dir_link: bool) -> String {
+        use std::os::unix::fs::symlink;
+        let key = cache::layer_key(digest);
+        let dir = cache::layer_dir(&key).unwrap();
+        if dir_link {
+            std::fs::create_dir_all(&dir).unwrap();
+            symlink(link, dir.join("etc")).unwrap();
+        } else {
+            std::fs::create_dir_all(dir.join("etc")).unwrap();
+            symlink(link, dir.join("etc/passwd")).unwrap();
+        }
+        key
+    }
+
+    /// A layer's `etc/passwd` symlinked to a file *outside* the layer must
+    /// never be read: that file is the host's, not the image's. The record
+    /// has to come from a lower layer's real file — or not at all.
+    #[test]
+    fn passwd_symlink_outside_layer_is_not_followed() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        // Stand-in for a host file: same uid as the image's `node`, but a
+        // home directory only the outside file knows about.
+        let outside = tmp.join("host-passwd");
+        std::fs::write(
+            &outside,
+            "node:x:1000:1000:Host:/leaked-from-host:/bin/sh\n",
+        )
+        .unwrap();
+        let outside_dir = tmp.join("host-etc");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("passwd"), std::fs::read(&outside).unwrap()).unwrap();
+
+        let real = make_layer_with_passwd("sha256:real-passwd");
+
+        // Upper layer symlinks the file itself.
+        let file_link = make_layer_with_passwd_symlink("sha256:file-link", &outside, false);
+        assert_eq!(
+            lookup_home_dir(&[file_link.clone(), real.clone()], 1000).unwrap(),
+            "/home/node",
+            "a symlinked etc/passwd must be skipped in favour of the lower layer's real file"
+        );
+        assert!(
+            lookup_home_dir(&[file_link], 1000).is_err(),
+            "with no real passwd in any layer the lookup must fail, not read the host file"
+        );
+
+        // Upper layer symlinks the whole `etc` directory.
+        let dir_link = make_layer_with_passwd_symlink("sha256:dir-link", &outside_dir, true);
+        assert_eq!(
+            lookup_home_dir(&[dir_link.clone(), real], 1000).unwrap(),
+            "/home/node",
+            "a symlinked etc/ directory must be skipped too"
+        );
+        assert!(lookup_home_dir(&[dir_link], 1000).is_err());
+    }
+
+    /// When nothing resolves *and* a layer's file was refused, the error
+    /// has to say so. Otherwise a hostile image that pointed `passwd` at
+    /// the host and a merely broken image produce the same "no user found",
+    /// and the one line that tells them apart sits in a log nobody opens.
+    #[test]
+    fn refused_passwd_is_named_in_the_error() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let outside = tmp.join("host-passwd");
+        std::fs::write(&outside, "node:x:1000:1000:Host:/leaked:/bin/sh\n").unwrap();
+        let link = make_layer_with_passwd_symlink("sha256:named-link", &outside, false);
+
+        let err = lookup_home_dir(std::slice::from_ref(&link), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no home directory found for uid 1000"),
+            "keeps the original not-found text: {err}"
+        );
+        assert!(
+            err.contains("etc/passwd") && err.contains("outside the layer"),
+            "names the refused file and why: {err}"
+        );
+
+        let err = resolve_user(std::slice::from_ref(&link), "node")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no user node found") && err.contains("outside the layer"),
+            "named-USER resolution reports the refusal too: {err}"
+        );
+
+        // An oversized file is refused for a different reason, and the
+        // error should say that one instead.
+        let key = cache::layer_key("sha256:named-huge");
+        let dir = cache::layer_dir(&key).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        let mut huge = "#".repeat(MAX_LAYER_RECORD_FILE as usize + 1);
+        huge.push_str("\nnode:x:1000:1000:Node:/home/node:/bin/sh\n");
+        std::fs::write(dir.join("etc/passwd"), huge).unwrap();
+        let err = lookup_home_dir(&[key], 1000).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "names the size refusal: {err}");
+    }
+
+    /// `lstat` refuses to follow only the *last* path component. A layer
+    /// with `etc -> <outside>` where `<outside>` happens to lack a `passwd`
+    /// must still be reported as an escaping symlink, not read as "this
+    /// layer has no such file".
+    #[test]
+    fn escaping_directory_symlink_is_reported_even_without_target_file() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let empty_outside = tmp.join("host-etc-empty");
+        std::fs::create_dir_all(&empty_outside).unwrap();
+        let link = make_layer_with_passwd_symlink("sha256:dir-link-empty", &empty_outside, true);
+
+        let err = lookup_home_dir(&[link], 1000).unwrap_err().to_string();
+        assert!(
+            err.contains("outside the layer"),
+            "escaping `etc` must be named even though `etc/passwd` does not exist: {err}"
+        );
+    }
+
+    /// The two remaining refusal reasons, each from an input tar can
+    /// actually produce: a *directory* named `etc/passwd` (not a regular
+    /// file) and a symlink whose target is missing from this layer.
+    #[test]
+    fn directory_and_dangling_symlink_refusals_are_named() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let dir_key = cache::layer_key("sha256:passwd-is-a-dir");
+        std::fs::create_dir_all(cache::layer_dir(&dir_key).unwrap().join("etc/passwd")).unwrap();
+        let err = lookup_home_dir(&[dir_key], 1000).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let dangling_key = cache::layer_key("sha256:passwd-dangling");
+        let dir = cache::layer_dir(&dangling_key).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::os::unix::fs::symlink("../usr/lib/passwd", dir.join("etc/passwd")).unwrap();
+        let err = lookup_home_dir(&[dangling_key], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be resolved"), "{err}");
+    }
+
+    /// Symlinks that stay *inside* the layer are legitimate (merged-usr
+    /// style `etc/passwd -> ../usr/lib/passwd`) and must keep resolving.
+    #[test]
+    fn passwd_symlink_inside_layer_is_followed() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let key = cache::layer_key("sha256:internal-link");
+        let dir = cache::layer_dir(&key).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::create_dir_all(dir.join("usr/lib")).unwrap();
+        std::fs::write(
+            dir.join("usr/lib/passwd"),
+            "node:x:1000:1000:Node:/home/node:/bin/sh\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../usr/lib/passwd", dir.join("etc/passwd")).unwrap();
+
+        assert_eq!(lookup_home_dir(&[key], 1000).unwrap(), "/home/node");
+    }
+
+    /// `/etc/passwd` is a few kilobytes. A layer whose copy is enormous is
+    /// not a passwd file, and reading it whole would let an image dictate
+    /// how much host memory `prepare` allocates.
+    #[test]
+    fn oversized_passwd_is_not_read() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let key = cache::layer_key("sha256:huge-passwd");
+        let dir = cache::layer_dir(&key).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        // Filler comment lines past the cap, then a record the old code
+        // would happily find at the end.
+        let mut huge = "#".repeat(MAX_LAYER_RECORD_FILE as usize + 1);
+        huge.push_str("\nnode:x:1000:1000:Node:/home/node:/bin/sh\n");
+        std::fs::write(dir.join("etc/passwd"), huge).unwrap();
+
+        assert!(
+            lookup_home_dir(&[key], 1000).is_err(),
+            "an oversized passwd must be treated as having no records"
+        );
     }
 
     /// Cache files written before `user` existed must still load — as

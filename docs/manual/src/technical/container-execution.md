@@ -11,7 +11,12 @@ directly via fork + chroot + exec:
   params). The image's `USER` is resolved host-side the same way Docker
   does it: names are looked up in the image's own `/etc/passwd` and
   `/etc/group`, a bare user takes its primary group from `passwd`, and an
-  unknown name is an error rather than a fallback to root.
+  unknown name is an error rather than a fallback to root. Those files
+  are read out of the image's extracted layers on the host, so a `passwd`
+  or `group` that is a symlink pointing outside its own layer (at a host
+  file, or a device) is ignored, as is one larger than 1 MiB; the lookup
+  then falls through to lower layers as it would for a whiteout. If nothing
+  resolves, the error names each ignored file and why it was refused.
 - **PTY** allocated when stdin is a TTY; the host terminal size is
   sent as the initial PTY dimensions, and resize events (SIGWINCH) are
   forwarded.
