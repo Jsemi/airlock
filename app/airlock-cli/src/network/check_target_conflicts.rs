@@ -143,10 +143,10 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> NetworkTarget {
-        let (host, port) = super::super::rules::parse_target(s);
+        let (host, port) = super::super::rules::parse_pattern(s).unwrap();
         NetworkTarget {
             host: host.to_string(),
-            port: port.and_then(|p| p.parse::<u16>().ok()),
+            port,
         }
     }
 

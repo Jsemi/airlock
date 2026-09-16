@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use super::http;
 use super::middleware::LogFn;
 use super::target::{InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget};
@@ -10,6 +12,7 @@ use crate::vault::Vault;
 /// `passthrough` is a subset of `allow`: entries from rules with
 /// `passthrough = true`. They're kept separate so the connect path can decide
 /// whether to short-circuit interception without re-scanning rule metadata.
+#[derive(Debug)]
 pub struct RuleTargets {
     pub allow: Vec<NetworkTarget>,
     pub deny: Vec<NetworkTarget>,
@@ -17,22 +20,25 @@ pub struct RuleTargets {
 }
 
 /// Resolve config rules into allow/deny/passthrough target lists.
-/// Disabled rules are skipped.
-pub fn resolve(network: &Network) -> RuleTargets {
+/// Disabled rules are skipped. Errors on a malformed pattern (see
+/// [`parse_pattern`]); config loading reports the same problems earlier
+/// with the offending rule named, so this is the fail-closed backstop.
+pub fn resolve(network: &Network) -> anyhow::Result<RuleTargets> {
     let mut allow = Vec::new();
     let mut deny = Vec::new();
     let mut passthrough = Vec::new();
 
-    for rule in network.rules.values() {
+    for (rule_name, rule) in &network.rules {
         if !rule.enabled {
             continue;
         }
 
         for target_str in &rule.allow {
-            let (host, port) = parse_target(target_str);
+            let (host, port) = parse_pattern(target_str)
+                .with_context(|| format!("network.rules.{rule_name}.allow"))?;
             let target = NetworkTarget {
                 host: host.to_string(),
-                port: port.and_then(|p| p.parse::<u16>().ok()),
+                port,
             };
             if rule.passthrough {
                 passthrough.push(target.clone());
@@ -41,19 +47,20 @@ pub fn resolve(network: &Network) -> RuleTargets {
         }
 
         for target_str in &rule.deny {
-            let (host, port) = parse_target(target_str);
+            let (host, port) = parse_pattern(target_str)
+                .with_context(|| format!("network.rules.{rule_name}.deny"))?;
             deny.push(NetworkTarget {
                 host: host.to_string(),
-                port: port.and_then(|p| p.parse::<u16>().ok()),
+                port,
             });
         }
     }
 
-    RuleTargets {
+    Ok(RuleTargets {
         allow,
         deny,
         passthrough,
-    }
+    })
 }
 
 /// Compile middleware from the `network.middleware` config section.
@@ -65,7 +72,7 @@ pub fn resolve_middleware(
 ) -> anyhow::Result<Vec<MiddlewareTarget>> {
     let mut targets = Vec::new();
 
-    for mw in network.middleware.values() {
+    for (mw_name, mw) in &network.middleware {
         if !mw.enabled {
             continue;
         }
@@ -73,10 +80,11 @@ pub fn resolve_middleware(
         let compiled = http::middleware::compile(&mw.script, &mw.env, vault, log.clone())?;
 
         for target_str in &mw.target {
-            let (host, port) = parse_target(target_str);
+            let (host, port) = parse_pattern(target_str)
+                .with_context(|| format!("network.middleware.{mw_name}.target"))?;
             targets.push(MiddlewareTarget {
                 host: host.to_string(),
-                port: port.and_then(|p| p.parse::<u16>().ok()),
+                port,
                 middleware: compiled.clone(),
             });
         }
@@ -111,10 +119,11 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
         }
 
         for target_str in &rule.allow {
-            let (host, port) = parse_target(target_str);
+            let (host, port) = parse_pattern(target_str)
+                .with_context(|| format!("network.rules.{rule_name}.allow"))?;
             targets.push(InjectTarget {
                 host: host.to_string(),
-                port: port.and_then(|p| p.parse::<u16>().ok()),
+                port,
                 secrets: secrets.clone(),
             });
         }
@@ -173,7 +182,7 @@ pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
     if let Some(rest) = target.strip_prefix('[') {
         // Bracketed IPv6 literal.
         return match rest.split_once(']') {
-            Some((host, after)) => (host, after.strip_prefix(':').filter(|p| !p.is_empty())),
+            Some((host, after)) => (host, after.strip_prefix(':')),
             None => (target, None), // malformed; treat whole as host
         };
     }
@@ -185,6 +194,25 @@ pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
         Some((host, port)) => (host, Some(port)),
         None => (target, None),
     }
+}
+
+/// Parse a `host[:port]` pattern into its matcher parts, with the port
+/// validated. `None` means "any port" and is produced only by an absent
+/// port or a literal `*`; every other port string is an error.
+///
+/// This must never fall back to the wildcard: under deny-by-default, a
+/// silently widened `allow = ["*:8O80"]` (letter O) or `["api.example.com:https"]`
+/// would grant every port instead of none, and a typo'd inject target would
+/// inject the secret into every port on that host.
+pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
+    let (host, port) = parse_target(target);
+    let port = match port {
+        None | Some("*") => None,
+        Some(p) => Some(p.parse::<u16>().map_err(|_| {
+            anyhow::anyhow!("`{target}`: port `{p}` must be a number in 0-65535 or `*`")
+        })?),
+    };
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -222,11 +250,101 @@ mod tests {
         assert_eq!(parse_target("2001:db8::1"), ("2001:db8::1", None));
         // Bracketed forms carry the port after the closing bracket.
         assert_eq!(parse_target("[::1]"), ("::1", None));
+        assert_eq!(parse_target("[::1]:"), ("::1", Some("")));
         assert_eq!(parse_target("[::1]:443"), ("::1", Some("443")));
         assert_eq!(
             parse_target("[2001:db8::1]:8080"),
             ("2001:db8::1", Some("8080"))
         );
+    }
+
+    #[test]
+    fn parse_pattern_accepts_numeric_and_star_ports() {
+        assert_eq!(
+            parse_pattern("api.example.com").unwrap(),
+            ("api.example.com", None)
+        );
+        assert_eq!(
+            parse_pattern("api.example.com:443").unwrap(),
+            ("api.example.com", Some(443))
+        );
+        assert_eq!(
+            parse_pattern("api.example.com:*").unwrap(),
+            ("api.example.com", None)
+        );
+        assert_eq!(parse_pattern("*:80").unwrap(), ("*", Some(80)));
+        assert_eq!(parse_pattern("*:*").unwrap(), ("*", None));
+        assert_eq!(parse_pattern("*").unwrap(), ("*", None));
+        assert_eq!(parse_pattern("[::1]:443").unwrap(), ("::1", Some(443)));
+        assert_eq!(parse_pattern("2001:db8::1").unwrap(), ("2001:db8::1", None));
+    }
+
+    #[test]
+    fn parse_pattern_rejects_malformed_ports() {
+        // Every one of these used to resolve to "any port".
+        for bad in [
+            "*:8O80", // letter O
+            "api.example.com:https",
+            "api.example.com:443 ", // trailing space
+            "api.example.com:",
+            "api.example.com:70000",
+            "api.example.com:-1",
+            "api.example.com:**",
+            "[::1]:x",
+            "[::1]:",
+        ] {
+            let err = parse_pattern(bad).unwrap_err().to_string();
+            assert!(err.contains(bad), "{bad}: {err}");
+            assert!(err.contains("must be a number"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_port_instead_of_widening() {
+        let mut rules = BTreeMap::new();
+        rules.insert("api".to_string(), rule(&["*:8O80"], false));
+        let err = resolve(&net_with_rules(rules)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("network.rules.api.allow"), "got: {msg}");
+        assert!(msg.contains("`*:8O80`"), "got: {msg}");
+
+        let mut rules = BTreeMap::new();
+        let mut r = rule(&["api.example.com"], false);
+        r.deny = vec!["internal.example.com:https".to_string()];
+        rules.insert("api".to_string(), r);
+        let msg = format!("{:#}", resolve(&net_with_rules(rules)).unwrap_err());
+        assert!(msg.contains("network.rules.api.deny"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_treats_star_port_as_any_port() {
+        let mut rules = BTreeMap::new();
+        rules.insert("api".to_string(), rule(&["api.example.com:*"], false));
+        let resolved = resolve(&net_with_rules(rules)).unwrap();
+        assert!(resolved.allow[0].matches("api.example.com", 443));
+        assert!(resolved.allow[0].matches("api.example.com", 8080));
+    }
+
+    #[test]
+    fn resolve_inject_rejects_malformed_port() {
+        let env = SandboxEnv::from_secrets(vec![secret("A", "aaaaaaaaaaaa")]);
+        let net = net_with(vec![(
+            "api",
+            inject_rule(&["api.example.com:443 "], &["A"], false),
+        )]);
+        let msg = format!("{:#}", resolve_inject(&net, &env).unwrap_err());
+        assert!(msg.contains("network.rules.api.allow"), "got: {msg}");
+        assert!(msg.contains("`api.example.com:443 `"), "got: {msg}");
+    }
+
+    fn net_with_rules(rules: BTreeMap<String, NetworkRule>) -> config::Network {
+        config::Network {
+            policy: Policy::DenyByDefault,
+            rules,
+            middleware: BTreeMap::default(),
+            ports: BTreeMap::default(),
+            sockets: BTreeMap::default(),
+        }
     }
 
     #[test]
@@ -241,7 +359,7 @@ mod tests {
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
         };
-        let resolved = resolve(&net);
+        let resolved = resolve(&net).unwrap();
         assert_eq!(resolved.allow.len(), 2);
         assert_eq!(resolved.passthrough.len(), 1);
         assert!(resolved.passthrough[0].matches("db.example.com", 5432));
@@ -347,7 +465,7 @@ mod tests {
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
         };
-        let resolved = resolve(&net);
+        let resolved = resolve(&net).unwrap();
         assert!(resolved.allow.is_empty());
         assert!(resolved.passthrough.is_empty());
     }

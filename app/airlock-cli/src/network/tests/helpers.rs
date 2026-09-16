@@ -209,7 +209,7 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         sockets: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
-    let rule_targets = rules::resolve(&config);
+    let rule_targets = rules::resolve(&config).unwrap();
     // Tests don't need real secret storage — a disabled vault gives
     // the substitution machinery a no-op backend and never prompts.
     let vault = crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled);

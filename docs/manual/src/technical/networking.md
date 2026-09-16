@@ -82,9 +82,14 @@ Pattern formats (same in `allow` and `deny`):
 
 - `host` — exact hostname, any port
 - `host:port` — exact hostname and port
+- `host:*` — exact hostname, any port (same as `host`)
 - `*:port` — any hostname on a specific port
 - `*.suffix` — subdomain wildcard
 - `*` — match all (use only for development)
+
+The port must be a number or `*`. Anything else (`:8O80` with a letter O,
+`:https`, a trailing space) is rejected when the config is loaded, so a
+typo can never silently widen a rule to every port.
 
 ## TLS interception
 

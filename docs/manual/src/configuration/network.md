@@ -55,6 +55,10 @@ deny = [
 ]
 ```
 
+The port part must be a number or `*` (or left out, which means the same as
+`*`). A malformed port such as `:8O80` or `:https` is a configuration error
+and airlock refuses to start, rather than quietly treating it as "any port".
+
 Deny patterns are always checked first and win unconditionally, regardless of
 allow rules. This makes it safe to use broad wildcards in allow lists while
 still blocking specific destinations.

@@ -5,6 +5,7 @@ use smart_config::DescribeConfig;
 
 use crate::config::de::format_error;
 use crate::config::{Config, presets};
+use crate::network::rules::parse_pattern;
 
 pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 
@@ -195,22 +196,38 @@ pub(super) fn parse_config(merged: serde_json::Value) -> anyhow::Result<Config> 
         anyhow::bail!("kvm is only supported on Linux");
     }
 
-    validate_inject(&config)?;
+    validate_network(&config)?;
 
     Ok(config)
 }
 
-/// Every name in an enabled rule's `inject` list must be an `[env]` entry
-/// with `mask = true` — injecting an unmasked value would mean the guest
-/// already holds the real secret, and injecting an undefined one is a typo.
-/// An injecting rule also cannot be `passthrough` (injection needs
-/// interception). Reported in the same shape as smart-config parse errors so
-/// the user sees one consistent "invalid configuration" block.
-fn validate_inject(config: &Config) -> anyhow::Result<()> {
+/// Cross-field checks on `[network]` that the schema cannot express,
+/// reported in the same shape as smart-config parse errors so the user sees
+/// one consistent "invalid configuration" block.
+///
+/// Target patterns: every `allow`/`deny`/middleware `target` entry of an
+/// enabled rule must have a port that is a number or `*` (or none). The
+/// proxy would otherwise have to pick a meaning for `*:8O80`, and the only
+/// safe one is "refuse to start" — treating it as "any port" turns a typo
+/// into a wide-open allow under deny-by-default.
+///
+/// Inject: every name in an enabled rule's `inject` list must be an `[env]`
+/// entry with `mask = true` — injecting an unmasked value would mean the
+/// guest already holds the real secret, and injecting an undefined one is a
+/// typo. An injecting rule also cannot be `passthrough` (injection needs
+/// interception).
+fn validate_network(config: &Config) -> anyhow::Result<()> {
     let mut problems: Vec<String> = Vec::new();
     for (rule_name, rule) in &config.network.rules {
         if !rule.enabled {
             continue;
+        }
+        for (field, patterns) in [("allow", &rule.allow), ("deny", &rule.deny)] {
+            for pattern in patterns {
+                if let Err(e) = parse_pattern(pattern) {
+                    problems.push(format!("* `network.rules.{rule_name}.{field}` {e}"));
+                }
+            }
         }
         if rule.passthrough && !rule.inject.is_empty() {
             problems.push(format!(
@@ -223,6 +240,16 @@ fn validate_inject(config: &Config) -> anyhow::Result<()> {
                 problems.push(format!(
                     "* `network.rules.{rule_name}.inject` `{var}` must be defined in [env] with mask = true"
                 ));
+            }
+        }
+    }
+    for (mw_name, mw) in &config.network.middleware {
+        if !mw.enabled {
+            continue;
+        }
+        for pattern in &mw.target {
+            if let Err(e) = parse_pattern(pattern) {
+                problems.push(format!("* `network.middleware.{mw_name}.target` {e}"));
             }
         }
     }

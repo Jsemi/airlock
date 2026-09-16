@@ -6,7 +6,7 @@ use crate::project::MaskedSecret;
 
 /// A resolved network target — parsed from a rule's `allow` or `deny` list
 /// at startup. Each target represents one `host[:port]` pattern.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkTarget {
     pub host: String,
     pub port: Option<u16>,

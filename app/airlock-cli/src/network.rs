@@ -58,15 +58,15 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
 
     let net = &project.config.network;
     let log = middleware::tracing_log();
-    let rule_targets = rules::resolve(net);
+    let rule_targets = rules::resolve(net)?;
     let middleware_targets = rules::resolve_middleware(net, &project.vault, &log)?;
     let inject_targets = rules::resolve_inject(net, &project.env)?;
 
     // Inject needs interception just like middleware, so it conflicts with
     // passthrough the same way.
-    let mut intercepting = labeled_middleware(net);
-    intercepting.extend(labeled_inject(net));
-    check_target_conflicts::check_passthrough_conflicts(&labeled_passthrough(net), &intercepting)?;
+    let mut intercepting = labeled_middleware(net)?;
+    intercepting.extend(labeled_inject(net)?);
+    check_target_conflicts::check_passthrough_conflicts(&labeled_passthrough(net)?, &intercepting)?;
     check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
@@ -122,48 +122,48 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
 /// is known.
 fn labeled_passthrough(
     net: &crate::config::config::Network,
-) -> Vec<check_target_conflicts::LabeledTarget> {
+) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
         if !rule.enabled || !rule.passthrough {
             continue;
         }
         for allow in &rule.allow {
-            let (host, port) = rules::parse_target(allow);
+            let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: format!("rule `{rule_name}` allow=`{allow}` (passthrough)"),
                 target: NetworkTarget {
                     host: host.to_string(),
-                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                    port,
                 },
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Extract labeled middleware targets from the config for conflict
 /// checking. Paired with [`labeled_passthrough`].
 fn labeled_middleware(
     net: &crate::config::config::Network,
-) -> Vec<check_target_conflicts::LabeledTarget> {
+) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (mw_name, mw) in &net.middleware {
         if !mw.enabled {
             continue;
         }
         for target_str in &mw.target {
-            let (host, port) = rules::parse_target(target_str);
+            let (host, port) = rules::parse_pattern(target_str)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: format!("middleware `{mw_name}` target=`{target_str}`"),
                 target: NetworkTarget {
                     host: host.to_string(),
-                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                    port,
                 },
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Extract labeled inject targets (allow patterns of rules with a non-empty
@@ -171,24 +171,24 @@ fn labeled_middleware(
 /// [`labeled_passthrough`], like [`labeled_middleware`].
 fn labeled_inject(
     net: &crate::config::config::Network,
-) -> Vec<check_target_conflicts::LabeledTarget> {
+) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
         if !rule.enabled || rule.inject.is_empty() {
             continue;
         }
         for allow in &rule.allow {
-            let (host, port) = rules::parse_target(allow);
+            let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: format!("rule `{rule_name}` inject target=`{allow}`"),
                 target: NetworkTarget {
                     host: host.to_string(),
-                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                    port,
                 },
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Extract labeled reverse port forwards (`.guest` entries) from the
@@ -495,6 +495,7 @@ mod labeled_target_tests {
             vec![],
         );
         let got: Vec<String> = labeled_passthrough(&n)
+            .unwrap()
             .into_iter()
             .map(|lt| lt.label)
             .collect();
@@ -516,7 +517,11 @@ mod labeled_target_tests {
             ],
             vec![],
         );
-        let got: Vec<String> = labeled_inject(&n).into_iter().map(|lt| lt.label).collect();
+        let got: Vec<String> = labeled_inject(&n)
+            .unwrap()
+            .into_iter()
+            .map(|lt| lt.label)
+            .collect();
         assert_eq!(got.len(), 2, "got: {got:?}");
         assert!(
             got.iter()
@@ -538,6 +543,7 @@ mod labeled_target_tests {
             ],
         );
         let got: Vec<String> = labeled_middleware(&n)
+            .unwrap()
             .into_iter()
             .map(|lt| lt.label)
             .collect();

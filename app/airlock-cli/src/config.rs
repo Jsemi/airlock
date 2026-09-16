@@ -588,7 +588,9 @@ pub mod config {
     /// A named network rule — allow/deny patterns for host:port targets.
     ///
     /// Target syntax: `host[:port]` — omitted port means all ports.
-    /// Both host and port support `*` wildcards.
+    /// Both host and port support `*` wildcards. A port that is neither a
+    /// number nor `*` (`:8O80`, `:https`, a trailing space) is a
+    /// configuration error, never a wildcard.
     ///
     /// `deny` is checked first and wins unconditionally. If no rule matches,
     /// the connection follows the network `policy`.
